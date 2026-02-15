@@ -1,0 +1,10 @@
+# Core dependencies
+python-dotenv>=1.0.0
+requests>=2.32.3
+loguru>=0.7.3
+web3>=7.14.0
+websockets>=15.0.1
+aiohttp>=3.9.0
+
+# Note: This bot requires kuru-mm-python to be available locally
+# at ../kuru-mm-python or installed as kuru-mm-py package
