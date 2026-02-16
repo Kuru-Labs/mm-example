@@ -50,6 +50,8 @@ class Quoter:
 
         This avoids floating point precision errors by doing the rounding
         in integer space (contract format) then converting back.
+        The SDK also applies tick rounding via price_rounding="default",
+        so this pre-alignment ensures consistency.
         """
         if not self.market_config:
             # Fallback to simple rounding if no market config
@@ -59,19 +61,16 @@ class Quoter:
         price_int = int(round(price * self.market_config.price_precision))
 
         # Round to nearest multiple of tick_size using ONLY integer arithmetic
-        tick_size = 100  # Hardcoded for MON-USDC
-        # Use integer division and modulo to avoid any float operations
+        tick_size = self.market_config.tick_size
         aligned_int = ((price_int + tick_size // 2) // tick_size) * tick_size
 
         # Convert back to human-readable float
-        # Add 0.5 to compensate for SDK using int() instead of round()
-        # This ensures int(aligned_price * precision) == aligned_int
-        aligned_price = (aligned_int + 0.5) / self.market_config.price_precision
+        aligned_price = aligned_int / self.market_config.price_precision
 
-        logger.debug(f"_round_to_tick: input={price:.10f}, price_int={price_int}, aligned_int={aligned_int}, output={aligned_price:.10f}, verify_int={int(aligned_price * self.market_config.price_precision)}, verify_round={int(round(aligned_price * self.market_config.price_precision))}")
+        logger.debug(f"_round_to_tick: input={price:.10f}, price_int={price_int}, aligned_int={aligned_int}, output={aligned_price:.10f}")
 
         # Ensure it's positive and non-zero
-        min_price = (tick_size + 0.5) / self.market_config.price_precision
+        min_price = tick_size / self.market_config.price_precision
         return max(aligned_price, min_price)
 
     def _calculate_prop_of_max_position(self) -> float:

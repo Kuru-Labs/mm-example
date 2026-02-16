@@ -31,7 +31,7 @@ async def main():
 
     # Load configuration
     logger.info("Loading configuration...")
-    kuru_config, market_config, bot_config = load_config_from_env()
+    wallet_config, connection_config, market_config, bot_config = load_config_from_env()
 
     logger.info(f"Market: {market_config.market_symbol}")
     logger.info(f"Max Position: {bot_config.max_position}")
@@ -40,7 +40,7 @@ async def main():
     logger.info(f"Strategy: {bot_config.strategy_type.value}")
 
     # Create bot
-    bot = Bot(kuru_config, market_config, bot_config)
+    bot = Bot(connection_config, wallet_config, market_config, bot_config)
 
     # Setup signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()

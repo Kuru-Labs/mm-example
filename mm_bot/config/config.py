@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from typing import List, Optional
 from dotenv import load_dotenv
-from mm_bot.kuru_imports import initialize_kuru_mm_config, market_config_from_market_address
+from mm_bot.kuru_imports import ConfigManager
 from mm_bot.quoter.quoter import StrategyType
 
 
@@ -17,7 +17,6 @@ class BotConfig:
     price_update_threshold_bps: float
     position_update_threshold_bps: float  # Position change (as BPS of max_position) that triggers update
     strategy_type: StrategyType = StrategyType.LONG
-    # New parameters
     quantity_bps_per_level: Optional[float] = None  # If set, overrides quantity
     override_start_position: Optional[float] = None  # Manual position override
     reconcile_interval: float = 300  # Seconds between reconciliation (0=disabled)
@@ -28,22 +27,20 @@ def load_config_from_env():
     Load all configurations from environment variables.
 
     Returns:
-        tuple: (kuru_config, market_config, bot_config)
+        tuple: (wallet_config, connection_config, market_config, bot_config)
     """
     load_dotenv()
 
-    # Load Kuru MM config
-    kuru_config = initialize_kuru_mm_config(
-        private_key=os.getenv("PRIVATE_KEY"),
-        rpc_url=os.getenv("RPC_URL", "https://rpc.fullnode.kuru.io/"),
-        rpc_ws_url=os.getenv("RPC_WS_URL", "wss://rpc.fullnode.kuru.io/")
-    )
+    # Load wallet config (reads PRIVATE_KEY from env)
+    wallet_config = ConfigManager.load_wallet_config()
 
-    # Load market config
-    market_address = os.getenv("MARKET_ADDRESS", "0x065c9d28e428a0db40191a54d33d5b7c71a9c394")
-    market_config = market_config_from_market_address(
-        market_address=market_address,
-        rpc_url=os.getenv("RPC_URL", "https://rpc.fullnode.kuru.io/")
+    # Load connection config (reads RPC_URL, RPC_WS_URL, etc. from env with defaults)
+    connection_config = ConfigManager.load_connection_config()
+
+    # Load market config from chain
+    market_config = ConfigManager.load_market_config(
+        market_address=os.getenv("MARKET_ADDRESS", "0x065c9d28e428a0db40191a54d33d5b7c71a9c394"),
+        fetch_from_chain=True,
     )
 
     # Load bot config
@@ -78,4 +75,4 @@ def load_config_from_env():
         reconcile_interval=float(os.getenv("RECONCILE_INTERVAL", "300"))
     )
 
-    return kuru_config, market_config, bot_config
+    return wallet_config, connection_config, market_config, bot_config

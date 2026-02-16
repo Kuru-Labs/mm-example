@@ -15,18 +15,12 @@ if [[ -z "$VIRTUAL_ENV" ]]; then
     fi
 fi
 
-# Install kuru-mm-python from local path
-echo "Installing kuru-mm-python from ../kuru-mm-python..."
-cd ../kuru-mm-python
-python3 -m pip install -e .
-cd - > /dev/null
-
-# Install other requirements
-echo "Installing other dependencies..."
-python3 -m pip install python-dotenv requests loguru
+# Install all requirements (including kuru-sdk-py from PyPI)
+echo "Installing dependencies..."
+python3 -m pip install -r requirements.txt
 
 echo "Installation complete!"
 echo ""
 echo "Next steps:"
 echo "1. Copy .env.example to .env and configure your settings"
-echo "2. Run the bot with: python3 src/main.py"
+echo "2. Run the bot with: ./run.sh"
