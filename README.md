@@ -1,153 +1,118 @@
-# Market Making Bot - kuru-mm-py Migration
+# Kuru Market Making Bot
 
-A market making bot migrated from the old kuru-sdk to the new kuru-mm-py SDK. This bot implements a skew-based quoting strategy with event-driven order tracking.
+A market making bot for Kuru DEX implementing a skew-based quoting strategy with event-driven order tracking.
 
-## Features
+## How It Works
 
-- **Event-driven architecture**: WebSocket callbacks for real-time order updates
-- **Skew-based quoting**: Adjusts spreads based on position relative to max position
-- **Multi-level quoters**: Multiple price levels (configurable via bps)
-- **Position tracking**: Automatic position updates on order fills
-- **PnL tracking**: Real-time profit/loss calculation
-- **Price threshold**: Only updates orders when price moves beyond threshold
-- **Graceful shutdown**: Cancels all active orders on exit
+The bot continuously quotes bid and ask orders around a reference price fetched from the Kuru oracle. It adjusts spreads based on the current position relative to the configured maximum — widening spreads in the entry direction and tightening them in the exit direction. This is the "skew" mechanism.
 
-## Architecture
+Each quoting level runs at a configured spread (in basis points). On each iteration, the bot cancels its previous orders and places fresh ones in a single transaction. Position changes are tracked via WebSocket fill callbacks rather than polling.
 
 ### Components
 
-1. **OracleService** (`src/pricing/oracle.py`)
-   - Fetches reference prices from Kuru API
-   - Extensible to support multiple price sources
+- **OracleService** (`mm_bot/pricing/oracle.py`) — fetches reference price from the Kuru API
+- **Quoter** (`mm_bot/quoter/quoter.py`) — generates bid/ask orders with skew-based pricing per level
+- **PositionTracker** (`mm_bot/position/position_tracker.py`) — updates position on order fill events
+- **PnlTracker** (`mm_bot/pnl/tracker.py`) — tracks unrealized PnL
+- **Bot** (`mm_bot/bot/bot.py`) — orchestrates the order lifecycle
+- **Config** (`mm_bot/config/config.py`) — loads configuration from environment variables
 
-2. **PositionTracker** (`src/position/position_tracker.py`)
-   - Tracks position changes via order fill callbacks
-   - Maintains current position and quote position
+## Prerequisites
 
-3. **Quoter** (`src/quoter/quoter.py`)
-   - Generates bid/ask orders with skew-based pricing
-   - Supports LONG and SHORT strategies
-   - Adjusts spreads based on position
-
-4. **PnlTracker** (`src/pnl/tracker.py`)
-   - Calculates unrealized PnL
-   - Formula: quote_position + (current_position * current_price)
-
-5. **Bot** (`src/bot/bot.py`)
-   - Main orchestrator
-   - Manages order lifecycle via callbacks
-   - Combines cancel + place in single transaction
-
-6. **Config** (`src/config/config.py`)
-   - Loads configuration from environment variables
-   - Initializes SDK configs
+- Python 3.10+
+- The `kuru-mm-python` package (see installation below)
 
 ## Installation
 
-### Prerequisites
-
-This bot requires the `kuru-mm-python` package to be available. The bot will automatically detect if it's installed as a package or available locally.
-
-1. **Ensure kuru-mm-python is available**:
-   - Either have it cloned at `../kuru-mm-python` (relative to this repo)
-   - Or have `kuru-mm-py` installed in your Python environment
-
-2. **Install dependencies**:
+**1. Clone and set up a virtual environment:**
 ```bash
-cd /Users/devblixt/Documents/GitHub/mm-example
-pip3 install -r requirements.txt
+git clone https://github.com/kuru-labs/mm-example.git
+cd mm-example
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-Alternatively, use the installation script:
+**2. Install the `kuru-mm-python` SDK:**
+
+If you have the SDK repo cloned locally at `../kuru-mm-python`:
 ```bash
-./install.sh
+pip install -e ../kuru-mm-python
 ```
 
-3. **Create `.env` file**:
+Or install from PyPI (if available):
+```bash
+pip install kuru-mm-py
+```
+
+**3. Install bot dependencies:**
+```bash
+pip install -r requirements.txt
+```
+
+**4. Configure environment variables:**
 ```bash
 cp .env.example .env
-```
-
-4. **Edit `.env` with your configuration**:
-```bash
-PRIVATE_KEY=your_private_key_here
-RPC_URL=https://rpc.fullnode.kuru.io/
-RPC_WS_URL=wss://rpc.fullnode.kuru.io/
-MARKET_ADDRESS=0x065C9d28E428A0db40191a54d33d5b7c71a9C394
-MAX_POSITION=1000
-PROP_SKEW_ENTRY=0.5
-PROP_SKEW_EXIT=0.5
-QUANTITY=100
-QUOTERS_BPS=25,50,75
-PRICE_UPDATE_THRESHOLD_BPS=10
-STRATEGY_TYPE=long
+# Edit .env with your settings
 ```
 
 ## Configuration
 
-### Environment Variables
+Create a `.env` file in the project root. All required and optional variables are listed below.
+
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `PRIVATE_KEY` | Wallet private key (no `0x` prefix) |
+| `MARKET_ADDRESS` | Kuru market contract address |
+
+### Optional (with defaults)
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PRIVATE_KEY` | Your wallet private key | Required |
-| `RPC_URL` | Ethereum RPC endpoint | `https://rpc.fullnode.kuru.io/` |
+| `RPC_URL` | HTTP RPC endpoint | `https://rpc.fullnode.kuru.io/` |
 | `RPC_WS_URL` | WebSocket RPC endpoint | `wss://rpc.fullnode.kuru.io/` |
-| `MARKET_ADDRESS` | Market contract address | `0x065C9d28E428A0db40191a54d33d5b7c71a9C394` |
-| `MAX_POSITION` | Maximum position size | `1000` |
-| `PROP_SKEW_ENTRY` | Entry skew proportion (0-1) | `0.5` |
-| `PROP_SKEW_EXIT` | Exit skew proportion (0-1) | `0.5` |
-| `QUANTITY` | Order size per quoter | `100` |
-| `QUOTERS_BPS` | Comma-separated bps levels | `25,50,75` |
-| `PRICE_UPDATE_THRESHOLD_BPS` | Price change threshold to update orders | `10` |
-| `STRATEGY_TYPE` | Strategy type: `long` or `short` | `long` |
+| `MAX_POSITION` | Maximum position size in base asset | `1000` |
+| `QUANTITY` | Order size per quoter level | `100` |
+| `QUOTERS_BPS` | Comma-separated spread levels in bps | `25,50,75` |
+| `PRICE_UPDATE_THRESHOLD_BPS` | Minimum price move (bps) before refreshing orders | `10` |
+| `POSITION_UPDATE_THRESHOLD_BPS` | Position change (bps of max) that triggers refresh | `500` |
+| `PROP_SKEW_ENTRY` | Spread widening factor when entering (0–1) | `0.5` |
+| `PROP_SKEW_EXIT` | Spread tightening factor when exiting (0–1) | `0.5` |
+| `STRATEGY_TYPE` | `long` or `short` | `long` |
+| `QUANTITY_BPS_PER_LEVEL` | If set, overrides `QUANTITY` with a position-proportional size | — |
+| `OVERRIDE_START_POSITION` | Manually set initial position (skips on-chain fetch) | — |
+| `RECONCILE_INTERVAL` | Seconds between position reconciliation (0 = disabled) | `300` |
 
 ### Strategy Types
 
-- **LONG**: Wider bids when long, tighter asks to exit
-- **SHORT**: Tighter bids when short, wider asks to exit
+- **`long`**: Widen bid spreads when long (slow to enter), tighten ask spreads (eager to exit)
+- **`short`**: Tighten bid spreads when short (eager to exit), widen ask spreads (slow to enter)
 
-### Skew Parameters
+### Skew Example
 
-- `PROP_SKEW_ENTRY`: How much to widen spreads when entering positions (0 = no skew, 1 = max skew)
-- `PROP_SKEW_EXIT`: How much to tighten spreads when exiting positions
+With `baseline_edge = 50 bps`, `PROP_SKEW_ENTRY = 0.5`, and position at 50% of max using the `long` strategy:
+- Bid edge = `50 × (1 + 0.5 × 0.5)` = **62.5 bps**
+- Ask edge = `50 × (1 - 0.5 × 0.5)` = **37.5 bps**
 
-Example: With `baseline_edge_bps=50`, `PROP_SKEW_ENTRY=0.5`, and position at 50% of max:
-- LONG strategy: bid edge = 50 * (1 + 0.5 * 0.5) = 62.5 bps, ask edge = 50 * (1 - 0.5 * 0.5) = 37.5 bps
+## Running the Bot
 
-## Usage
-
-### Run the bot:
 ```bash
-python src/main.py
+./run.sh
 ```
 
-### Stop the bot:
-Press `Ctrl+C` for graceful shutdown (cancels all active orders)
+Or manually:
+```bash
+source venv/bin/activate
+PYTHONPATH=. python3 mm_bot/main.py
+```
 
-## Order Lifecycle
-
-1. **Order Creation**: Quoter generates orders with unique CLOIDs
-2. **Order Submission**: Bot combines cancels + new orders in single transaction
-3. **Order Confirmation**: Callback updates `active_cloids` set
-4. **Order Fill**: Position tracker updates position on fill
-5. **Order Cancellation**: Next iteration cancels old orders before placing new ones
-
-### CLOID Format
-
-CLOIDs are unique per quoter and timestamp:
-- Format: `{side}-{baseline_edge_bps}-{timestamp_ms}`
-- Example: `bid-50-1706789123456`
+Press `Ctrl+C` to stop — the bot will cancel all active orders before exiting.
 
 ## Monitoring
 
-The bot logs:
-- Order placements and cancellations
-- Order fills (with price and size)
-- Position updates
-- PnL calculations
-- Transaction hashes
+The bot logs order activity, fills, position changes, and PnL to stdout:
 
-Example output:
 ```
 INFO: Iteration 42: Placing 6 orders, cancelling 6
 INFO: Transaction hash: 0x1234...
@@ -160,101 +125,49 @@ INFO: PnL: -1.95
 
 ```
 mm-example/
-├── src/
-│   ├── main.py                   # Entry point
+├── mm_bot/
+│   ├── main.py                    # Entry point
 │   ├── bot/
-│   │   └── bot.py                # Main bot logic
+│   │   └── bot.py                 # Main bot logic
 │   ├── quoter/
-│   │   └── quoter.py             # Skew-based quoter
+│   │   └── quoter.py              # Skew-based quoter
 │   ├── position/
-│   │   └── position_tracker.py   # Position tracking
+│   │   └── position_tracker.py    # Position tracking
 │   ├── pricing/
-│   │   └── oracle.py             # Price oracle
+│   │   └── oracle.py              # Price oracle
 │   ├── pnl/
-│   │   └── tracker.py            # PnL tracker
+│   │   └── tracker.py             # PnL tracker
 │   └── config/
-│       └── config.py             # Configuration loader
-├── .env.example                   # Environment template
+│       └── config.py              # Configuration loader
+├── run.sh                         # Bot runner script
+├── install.sh                     # Dependency installer
 ├── requirements.txt               # Python dependencies
-└── README.md                      # This file
-```
-
-## Migration from Old SDK
-
-This bot was migrated from kuru-sdk (v0.2.8) to kuru-mm-py. Key changes:
-
-### Architecture Changes
-- **Polling → Event-driven**: Position tracking now uses callbacks instead of polling
-- **Manual nonce → Automatic**: SDK handles nonce management
-- **Separate queues → Unified API**: `place_orders()` handles both cancel and place
-- **CLOID tracking**: Unique CLOIDs generated per quoter + timestamp
-
-### SDK API Changes
-- `ClientOrderExecutor` → `KuruClient`
-- `OrderRequest` → `Order` dataclass
-- Added `OrderType`, `OrderSide`, `OrderStatus` enums
-- `await KuruClient.create()` factory pattern
-
-### Position Tracking
-- Old: `PositionManager` with 0.5s polling
-- New: `PositionTracker` with fill event callbacks
-
-### Order Placement
-- Old: Separate `PlaceOrderQueue` and `CancelQueue`
-- New: Single `client.place_orders([cancel_orders + new_orders])`
-
-## Development
-
-### Running Tests
-```bash
-# TODO: Add unit tests
-pytest tests/
-```
-
-### Code Style
-```bash
-# Format code
-black src/
-
-# Lint
-ruff check src/
+└── .env.example                   # Environment variable template
 ```
 
 ## Troubleshooting
 
-### WebSocket Connection Issues
-- Check `RPC_WS_URL` is correct
-- Ensure firewall allows WebSocket connections
-- SDK has auto-reconnect built-in
+**Orders not placing**
+- Verify you have sufficient margin balances (base and quote) on the market
+- Confirm `MARKET_ADDRESS` is correct for the asset you intend to trade
 
-### Position Drift
-- Position tracker logs all fills
-- Check logs for missed fill events
-- Consider adding periodic reconciliation (future enhancement)
+**Position drift**
+- All fill events are logged — check logs for any gaps
+- Adjust `RECONCILE_INTERVAL` to reconcile position against on-chain state periodically
 
-### Orders Not Placing
-- Check margin balances (base and quote)
-- Verify price precision matches market tick size
-- Check for CLOID collisions (should be impossible with timestamp-based generation)
+**WebSocket disconnects**
+- The SDK has built-in auto-reconnect
+- Check that `RPC_WS_URL` is reachable from your network
 
-### Price Fetching Fails
-- Oracle falls back to None if API fails
-- Bot skips iteration if no reference price
-- Check Kuru API status
+**No reference price**
+- The bot skips iterations when the oracle returns no price
+- Check Kuru API availability
 
 ## Security
 
-- **Never commit `.env` file** - contains private key
-- Use environment variables for all secrets
-- Run bot in secure environment
-- Monitor for unusual activity
+- Never commit your `.env` file — it contains your private key
+- Use a dedicated wallet with only the funds needed for market making
 
 ## License
 
 MIT
-
-## Support
-
-For issues or questions:
-- GitHub Issues: https://github.com/anthropics/claude-code/issues
-- Kuru Docs: https://docs.kuru.io
