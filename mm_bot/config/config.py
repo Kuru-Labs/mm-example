@@ -14,8 +14,7 @@ class BotConfig:
     prop_skew_exit: float
     quantity: float
     quoters_bps: List[float]
-    price_update_threshold_bps: float
-    position_update_threshold_bps: float  # Position change (as BPS of max_position) that triggers update
+    prop_maintain: float  # Cancel threshold factor (0.2 = keep orders with edge >= 80% of target)
     strategy_type: StrategyType = StrategyType.LONG
     # New parameters
     quantity_bps_per_level: Optional[float] = None  # If set, overrides quantity
@@ -70,8 +69,7 @@ def load_config_from_env():
         prop_skew_exit=float(os.getenv("PROP_SKEW_EXIT", "0.5")),
         quantity=quantity,
         quoters_bps=quoters_bps,
-        price_update_threshold_bps=float(os.getenv("PRICE_UPDATE_THRESHOLD_BPS", "10")),
-        position_update_threshold_bps=float(os.getenv("POSITION_UPDATE_THRESHOLD_BPS", "500")),
+        prop_maintain=float(os.getenv("PROP_MAINTAIN", "0.2")),
         strategy_type=strategy_type,
         quantity_bps_per_level=quantity_bps_per_level,
         override_start_position=override_start_position,

@@ -62,8 +62,6 @@ class Bot:
         self.cloid_to_order_id: Dict[str, int] = {}  # Track cloid → order_id mapping
         self.order_id_to_cloid: Dict[int, str] = {}  # Track order_id → cloid mapping
         self.order_sizes: Dict[str, float] = {}  # Track cloid → original_size for fill calculation
-        self.last_reference_price: Optional[float] = None
-        self.last_position_at_update: Optional[float] = None  # Track position at last update
         self.last_reconcile_time: float = 0.0
 
         # Pre-registration for immediate fills (orders sent but not yet confirmed)
@@ -71,6 +69,9 @@ class Bot:
 
         # Active orders tracked from callbacks (for inventory, no API calls needed)
         self.active_orders: Dict[str, OrderInfo] = {}  # cloid → OrderInfo
+
+        # Orphaned order tracking (orders on chain but no callback received)
+        self.orphaned_order_timestamps: Dict[int, float] = {}  # order_id → first_seen_timestamp
 
         # Validation counter for periodic API checks
         self._validation_counter: int = 0
@@ -81,7 +82,10 @@ class Bot:
         # Oracle service - using Coinbase for MON-USD price
         self.oracle_service = OracleService()
         self.oracle_service.add_price_source("coinbase", CoinbasePriceSource("MON-USD"))
-        self.oracle_service.add_price_source("kuru", KuruPriceSource())  # Fallback
+
+        # Kuru WebSocket price source (will be started in start() method)
+        self.kuru_price_source = KuruPriceSource()
+        self.oracle_service.add_price_source("kuru", self.kuru_price_source)
 
         # PnL tracker (will be initialized after position tracker in start())
         self.pnl_tracker: Optional[PnlTracker] = None
@@ -150,6 +154,11 @@ class Bot:
                 size=order.size,
                 order_id=order.kuru_order_id
             )
+
+            # Clear orphaned tracking if this order was previously detected as orphaned
+            if order.kuru_order_id in self.orphaned_order_timestamps:
+                self._debug_log(f"[ORDER] Order {order.kuru_order_id} callback arrived (was orphaned), clearing tracking")
+                del self.orphaned_order_timestamps[order.kuru_order_id]
 
             # DEBUG: Log placement and current tracking state
             self._debug_log(f"[ORDER] PLACED - {order.cloid} with size {order.size}")
@@ -320,6 +329,10 @@ class Bot:
         await self.client.start()
         logger.success(f"Connected to market: {self.market_config.market_symbol}")
 
+        # Start Kuru WebSocket price feed
+        logger.info("Connecting to Kuru orderbook WebSocket...")
+        self.kuru_price_source.start(self.market_config.market_address)
+
         # ONE-TIME cleanup: Cancel any leftover orders from previous runs
         await self._cancel_all_existing_orders()
 
@@ -343,29 +356,60 @@ class Bot:
     async def _initialize_position_tracker(self) -> None:
         """
         Initialize position tracker with starting position.
-        Uses override if provided, otherwise defaults to 0 (neutral strategy).
+        Priority: 1) Saved state, 2) Config override, 3) Default to 0
         Position tracking represents net buys/sells, not total holdings.
         """
         try:
+            # Try to load saved state first
+            from pathlib import Path
+            state_file = Path("tracking") / "position_state.json"
+            saved_state = PositionTracker.load_state(state_file)
+
             if self.bot_config.override_start_position is not None:
+                # Config override takes precedence
                 start_position = self.bot_config.override_start_position
-                self._debug_log(f"[INIT] Using OVERRIDE start position: {start_position:.6f}")
-                logger.info(f"Using override starting position: {start_position:.6f}")
+                current_position = 0.0
+                quote_position = 0.0
+                self._debug_log(f"[INIT] Using CONFIG OVERRIDE start position: {start_position:.6f}")
+                logger.info(f"Using override starting position: {start_position:.6f} (ignoring saved state)")
+            elif saved_state:
+                # Restore from saved state
+                start_position = saved_state.get('start_position', 0.0)
+                current_position = saved_state.get('current_position', 0.0)
+                quote_position = saved_state.get('quote_position', 0.0)
+                total_position = saved_state.get('total_position', start_position + current_position)
+                self._debug_log(f"[INIT] Restoring from saved state:")
+                self._debug_log(f"[INIT]   start_position: {start_position:.6f}")
+                self._debug_log(f"[INIT]   current_position: {current_position:.6f}")
+                self._debug_log(f"[INIT]   total_position: {total_position:.6f}")
+                logger.info(f"Restored position from saved state: {total_position:.2f} "
+                           f"(last updated: {saved_state.get('last_updated', 'unknown')})")
             else:
                 # Default to 0 for neutral market-making strategy
                 start_position = 0.0
-                self._debug_log(f"[INIT] Defaulting to start position: 0.0 (neutral strategy)")
+                current_position = 0.0
+                quote_position = 0.0
+                self._debug_log(f"[INIT] No saved state - defaulting to start position: 0.0 (neutral strategy)")
                 logger.info("Starting position set to 0 (neutral strategy - tracks net buys/sells)")
 
             # Initialize position tracker
             self.position_tracker = PositionTracker(start_position=start_position)
+
+            # Restore state if loaded
+            if saved_state and self.bot_config.override_start_position is None:
+                self.position_tracker.current_position = current_position
+                self.position_tracker.quote_position = quote_position
+
             self._debug_log(f"[INIT] ✓ Position tracker initialized")
             self._debug_log(f"[INIT]   start_position: {self.position_tracker.get_start_position():.6f}")
-            self._debug_log(f"[INIT]   current_position: {self.position_tracker.get_current_position():.6f}\n")
-            logger.success(f"✓ Position tracker initialized with start_position={start_position:.6f}")
+            self._debug_log(f"[INIT]   current_position: {self.position_tracker.get_current_position():.6f}")
+            self._debug_log(f"[INIT]   total_position: {self.position_tracker.get_current_position() + self.position_tracker.get_start_position():.6f}\n")
+            logger.success(f"✓ Position tracker initialized: total={self.position_tracker.get_current_position() + self.position_tracker.get_start_position():.2f}")
 
         except Exception as e:
             logger.error(f"Failed to initialize position tracker: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             logger.warning("Falling back to start_position=0.0")
             self.position_tracker = PositionTracker(start_position=0.0)
 
@@ -579,19 +623,92 @@ class Bot:
     async def _validate_against_api(self) -> None:
         """
         Periodically validate our callback-tracked state against API.
-        Call this every ~10 reconciliations, not every time.
+
+        Quick check (every reconciliation): Detect orphaned orders
+        Full check (every 10th): Compare all order IDs and clean up phantoms
         """
         try:
             self._validation_counter += 1
 
-            # Only validate every 10th reconciliation
+            # Fetch actual active orders from API
+            api_active_orders = self.client.user.get_active_orders()
+
+            # QUICK CHECK (every time): Detect orphaned orders
+            # This is critical for detecting lost callbacks quickly
+            api_order_ids = {int(order.get('orderid')) for order in api_active_orders if order.get('orderid') is not None}
+            tracked_order_ids = {info.order_id for info in self.active_orders.values()}
+            missing_in_tracked = api_order_ids - tracked_order_ids
+
+            current_time = time.time()
+            orphan_timeout = 3.0  # seconds - grace period for late callbacks
+
+            if missing_in_tracked:
+                # Track when we first saw these orphaned orders
+                for order_id in missing_in_tracked:
+                    if order_id not in self.orphaned_order_timestamps:
+                        # First time seeing this orphaned order
+                        self.orphaned_order_timestamps[order_id] = current_time
+                        logger.warning(
+                            f"⚠️ Orphaned order detected: {order_id} on chain but no callback yet. "
+                            f"Waiting {orphan_timeout}s for late callback..."
+                        )
+                        self._debug_log(f"[VALIDATE] New orphaned order: {order_id}, starting grace period")
+                    else:
+                        # Already tracking this orphan
+                        time_orphaned = current_time - self.orphaned_order_timestamps[order_id]
+                        self._debug_log(
+                            f"[VALIDATE] Still orphaned: {order_id}, age={time_orphaned:.1f}s "
+                            f"(timeout at {orphan_timeout}s)"
+                        )
+
+                # Check if any orphaned orders have exceeded grace period
+                old_orphans = []
+                for order_id in missing_in_tracked:
+                    time_orphaned = current_time - self.orphaned_order_timestamps.get(order_id, current_time)
+                    if time_orphaned > orphan_timeout:
+                        old_orphans.append(order_id)
+                        self._debug_log(f"[VALIDATE] Orphan {order_id} exceeded timeout: {time_orphaned:.1f}s > {orphan_timeout}s")
+
+                self._debug_log(
+                    f"[VALIDATE] Orphan summary: {len(missing_in_tracked)} total orphans, "
+                    f"{len(old_orphans)} exceeded timeout, "
+                    f"{len(missing_in_tracked) - len(old_orphans)} still in grace period"
+                )
+
+                if old_orphans:
+                    # Orphaned orders exceeded grace period - callbacks were lost
+                    logger.error(
+                        f"🚨 ORPHANED ORDERS TIMEOUT: {len(old_orphans)} orders on chain for >{orphan_timeout}s with no callbacks. "
+                        f"Order IDs: {old_orphans}. Callbacks lost. Cancelling all and resetting state..."
+                    )
+                    self._debug_log(f"[VALIDATE] Orphaned orders timed out: {old_orphans} - triggering full reset")
+
+                    # Cancel all active orders
+                    await self._cancel_all_existing_orders()
+
+                    # Clear all tracking state
+                    self.active_orders.clear()
+                    self.order_sizes.clear()
+                    self.preregistered_orders.clear()
+                    self.active_cloids.clear()
+                    self.cloid_to_order_id.clear()
+                    self.order_id_to_cloid.clear()
+                    self.orphaned_order_timestamps.clear()
+
+                    logger.info("✓ State reset complete. Will resume quoting on next iteration.")
+                    self._debug_log(f"[VALIDATE] State cleared, ready for fresh start")
+                    return
+            else:
+                # No orphaned orders - clear tracking
+                if self.orphaned_order_timestamps:
+                    self._debug_log(f"[VALIDATE] All previously orphaned orders now tracked, clearing orphan tracking")
+                    self.orphaned_order_timestamps.clear()
+
+            # FULL VALIDATION (every 10th reconciliation): Detailed comparison
             if self._validation_counter % 10 != 0:
                 return
 
-            self._debug_log(f"[VALIDATE] ===== API VALIDATION =====")
-
-            # Fetch actual active orders from API
-            api_active_orders = self.client.user.get_active_orders()
+            self._debug_log(f"[VALIDATE] ===== FULL API VALIDATION =====")
 
             # Compare counts
             tracked_count = len(self.active_orders)
@@ -603,31 +720,22 @@ class Bot:
                 )
                 self._debug_log(f"[VALIDATE] Count mismatch: tracked={tracked_count}, api={api_count}")
 
-            # Compare order IDs (use 'orderid' lowercase to match API response)
-            api_order_ids = {int(order.get('orderid')) for order in api_active_orders if order.get('orderid') is not None}
-            tracked_order_ids = {info.order_id for info in self.active_orders.values()}
-
-            missing_in_tracked = api_order_ids - tracked_order_ids
+            # Check for phantom orders (tracked but not on chain)
             missing_in_api = tracked_order_ids - api_order_ids
-
-            if missing_in_tracked:
-                logger.warning(f"⚠️ Orders on chain but not tracked: {missing_in_tracked}")
-                self._debug_log(f"[VALIDATE] Missing in tracked: {missing_in_tracked}")
 
             if missing_in_api:
                 logger.warning(f"⚠️ Orders tracked but not on chain: {missing_in_api}")
                 self._debug_log(f"[VALIDATE] Missing in API (phantom orders): {missing_in_api}")
-                # Clean up phantom orders
                 for cloid, info in list(self.active_orders.items()):
                     if info.order_id in missing_in_api:
                         logger.warning(f"Cleaning up phantom order: {cloid}")
                         del self.active_orders[cloid]
                         self._debug_log(f"[VALIDATE] Cleaned up phantom: {cloid}")
 
-            if tracked_count == api_count and not missing_in_tracked and not missing_in_api:
-                self._debug_log(f"[VALIDATE] ✓ All orders match!")
+            if tracked_count == api_count and not missing_in_api:
+                self._debug_log(f"[VALIDATE] ✓ All orders match (full validation)!")
 
-            self._debug_log(f"[VALIDATE] ===== END VALIDATION =====")
+            self._debug_log(f"[VALIDATE] ===== END FULL VALIDATION =====")
 
         except Exception as e:
             logger.error(f"Failed to validate against API: {e}")
@@ -644,7 +752,7 @@ class Bot:
             stale_timeout = 5  # seconds (short timeout since transactions are fast)
 
             stale_cloids = []
-            for cloid, (size, timestamp) in self.preregistered_orders.items():
+            for cloid, (_, timestamp) in self.preregistered_orders.items():
                 age = current_time - timestamp
                 if age > stale_timeout:
                     stale_cloids.append(cloid)
@@ -717,154 +825,45 @@ class Bot:
                     await asyncio.sleep(1.0)
                     continue
 
-                # Check price threshold
-                should_update = self._should_update_orders(reference_price)
-                logger.info(f"Iteration {iteration}: Price=${reference_price:.5f}, should_update={should_update}")
+                logger.info(f"Iteration {iteration}: Price=${reference_price:.5f}")
 
-                if should_update:
-                    # Build order list: cancels + new orders
-                    all_orders = []
+                # Get current on-chain active orders
+                on_chain_orders = self.client.user.get_active_orders()
 
-                    # Get current on-chain active orders to validate before cancelling
-                    on_chain_orders = self.client.user.get_active_orders()
+                # Use PropMaintain logic to generate orders (only cancels orders below cancel threshold)
+                all_orders, num_cancels, num_new_orders = self._generate_orders_with_prop_maintain(
+                    reference_price, on_chain_orders
+                )
 
-                    # Build set of on-chain order IDs
-                    on_chain_order_ids = {int(order.get('orderid')) for order in on_chain_orders if order.get('orderid') is not None}
+                logger.info(f"PropMaintain: {num_cancels} cancels, {num_new_orders} new orders")
 
-                    # Filter tracked CLOIDs: keep only those whose order_id still exists on-chain
-                    tracked_cloids = list(self.active_cloids)
-                    valid_cloids = []
-                    for cloid in tracked_cloids:
-                        order_id = self.cloid_to_order_id.get(cloid)
-                        if order_id is not None and order_id in on_chain_order_ids:
-                            valid_cloids.append(cloid)
+                # Validate balance before placing orders
+                if all_orders:
+                    all_orders = await self._filter_orders_by_balance(all_orders, on_chain_orders)
 
-                    filtered_count = len(tracked_cloids) - len(valid_cloids)
+                if all_orders:
+                    # Debug: Check orders before sending
+                    logger.info(f"Order details before sending:")
+                    for order in all_orders:
+                        order_type_str = "CANCEL" if order.order_type == OrderType.CANCEL else "LIMIT"
+                        logger.info(f"  {order.cloid}: type={order_type_str}, side={order.side}, price={order.price}, size={order.size}")
 
-                    if filtered_count > 0:
-                        logger.debug(f"Filtered out {filtered_count} orders that no longer exist on-chain")
+                    # PRE-REGISTER new orders BEFORE sending (handles immediate fills)
+                    for order in all_orders:
+                        if order.order_type == OrderType.LIMIT and order.size is not None:
+                            # Skip cancels, only pre-register new limit orders
+                            self.preregistered_orders[order.cloid] = (order.size, time.time())
+                            self.order_sizes[order.cloid] = order.size
+                            self._debug_log(f"[PRESEND] Pre-registered {order.cloid} with size {order.size}")
 
-                    # Cancel only orders that still exist on-chain
-                    for cloid in valid_cloids:
-                        all_orders.append(Order(cloid=cloid, order_type=OrderType.CANCEL))
+                    # Single transaction for cancel + place
+                    txhash = await self.client.place_orders(all_orders, post_only=False)
+                    logger.info(f"Transaction hash: {txhash}")
 
-                    num_cancels = len(valid_cloids)
-
-                    # Get new orders from all quoters
-                    new_orders = []
-                    for quoter in self.quoters:
-                        quoter_orders = quoter.get_orders()
-                        logger.debug(f"Quoter {quoter.baseline_edge_bps}bps generated {len(quoter_orders)} orders")
-                        new_orders.extend(quoter_orders)
-
-                    # Validate balance before placing orders
-                    # Get current margin balances
-                    base_wei, quote_wei = await self.client.user.get_margin_balances()
-                    base_balance = base_wei / (10 ** self.market_config.base_token_decimals)
-                    quote_balance = quote_wei / (10 ** self.market_config.quote_token_decimals)
-
-                    # Calculate locked balances from on-chain orders
-                    locked_base = 0.0
-                    locked_quote = 0.0
-                    for order in on_chain_orders:
-                        is_buy = order.get("isbuy", False)
-                        size = float(order.get("size", 0)) / self.market_config.size_precision
-                        price = float(order.get("price", 0)) / self.market_config.price_precision
-
-                        if is_buy:
-                            locked_quote += size * price
-                        else:
-                            locked_base += size
-
-                    # Calculate free balances (excluding orders we're about to cancel)
-                    free_base = base_balance - locked_base
-                    free_quote = quote_balance - locked_quote
-
-                    # Add back the balances from orders we're cancelling
-                    for cloid in valid_cloids:
-                        order_id = self.cloid_to_order_id.get(cloid)
-                        if order_id is None:
-                            continue
-
-                        for order in on_chain_orders:
-                            if int(order.get('orderid', 0)) == order_id:
-                                is_buy = order.get("isbuy", False)
-                                size = float(order.get("size", 0)) / self.market_config.size_precision
-                                price = float(order.get("price", 0)) / self.market_config.price_precision
-
-                                if is_buy:
-                                    free_quote += size * price
-                                else:
-                                    free_base += size
-                                break
-
-                    # Calculate required balances for new orders
-                    required_base = 0.0
-                    required_quote = 0.0
-                    buy_orders = []
-                    sell_orders = []
-
-                    for order in new_orders:
-                        if order.side == OrderSide.BUY:
-                            buy_orders.append(order)
-                            required_quote += order.size * order.price
-                        elif order.side == OrderSide.SELL:
-                            sell_orders.append(order)
-                            required_base += order.size
-
-                    # Filter orders based on available balance
-                    filtered_orders = []
-                    skipped_buys = 0
-                    skipped_sells = 0
-
-                    # Add buy orders only if we have enough quote balance
-                    if required_quote <= free_quote:
-                        filtered_orders.extend(buy_orders)
-                    else:
-                        skipped_buys = len(buy_orders)
-                        logger.warning(f"⚠️  Insufficient quote balance for buy orders. Need {required_quote:.2f}, have {free_quote:.2f}. Skipping {skipped_buys} buy orders.")
-
-                    # Add sell orders only if we have enough base balance
-                    if required_base <= free_base:
-                        filtered_orders.extend(sell_orders)
-                    else:
-                        skipped_sells = len(sell_orders)
-                        logger.warning(f"⚠️  Insufficient base balance for sell orders. Need {required_base:.2f}, have {free_base:.2f}. Skipping {skipped_sells} sell orders.")
-
-                    # Add filtered orders to transaction
-                    all_orders.extend(filtered_orders)
-
-                    logger.info(f"Balance check: Free base={free_base:.2f}, Free quote={free_quote:.2f}")
-                    logger.info(f"Total orders to place: {len(all_orders)} (cancels: {num_cancels}, new: {len(filtered_orders)}, skipped: {skipped_buys + skipped_sells})")
-
-                    # Debug: log order details
-                    for i, order in enumerate(all_orders):
-                        logger.debug(f"Order {i}: {order}")
-
-                    if all_orders:
-                        # Debug: Check orders before sending
-                        logger.info(f"Order details before sending:")
-                        for order in all_orders:
-                            logger.info(f"  {order.cloid}: side={order.side}, type={order.order_type}, price={order.price}, size={order.size}")
-
-                        # PRE-REGISTER new orders BEFORE sending (handles immediate fills)
-                        for order in all_orders:
-                            if order.order_type == OrderType.LIMIT and order.size is not None:
-                                # Skip cancels, only pre-register new limit orders
-                                self.preregistered_orders[order.cloid] = (order.size, time.time())
-                                self.order_sizes[order.cloid] = order.size
-                                self._debug_log(f"[PRESEND] Pre-registered {order.cloid} with size {order.size}")
-
-                        # Single transaction for cancel + place
-                        txhash = await self.client.place_orders(all_orders, post_only=False)
-                        logger.info(f"Transaction hash: {txhash}")
-
-                        # Update last reference price and position
-                        self.last_reference_price = reference_price
-                        self.last_position_at_update = self.position_tracker.get_current_position()
-
-                        # Print PnL
-                        self.pnl_tracker.print_pnl()
+                    # Print PnL
+                    self.pnl_tracker.print_pnl()
+                else:
+                    logger.debug("No order updates needed (PropMaintain kept existing orders)")
 
                 # Sleep 1 second
                 try:
@@ -877,43 +876,233 @@ class Bot:
                 logger.error(f"Error in main loop: {e}")
                 await asyncio.sleep(1.0)
 
-    def _should_update_orders(self, current_price: float) -> bool:
+    def _generate_orders_with_prop_maintain(self, reference_price: float, on_chain_orders: list) -> tuple[list[Order], int, int]:
         """
-        Check if orders should be updated based on price or position threshold.
+        Generate orders using PropMaintain logic: only cancel orders below cancel threshold.
 
         Args:
-            current_price: Current reference price
+            reference_price: Current fair/reference price
+            on_chain_orders: List of active orders from API
 
         Returns:
-            True if orders should be updated
+            tuple: (all_orders, num_cancels, num_new_orders)
         """
-        # First iteration - always update
-        if self.last_reference_price is None:
-            return True
+        all_orders = []
+        total_cancels = 0
+        total_new_orders = 0
 
-        # Check price change
-        price_change_bps = abs(
-            (current_price - self.last_reference_price) / self.last_reference_price * 10000
-        )
+        # Build map of on-chain orders by cloid (for our orders only)
+        on_chain_by_cloid = {}
+        on_chain_order_ids = set()
 
-        if price_change_bps >= self.bot_config.price_update_threshold_bps:
-            logger.debug(f"Update triggered by price change: {price_change_bps:.2f} bps")
-            return True
+        for order in on_chain_orders:
+            order_id = int(order.get('orderid', 0))
+            if order_id in self.order_id_to_cloid:
+                cloid = self.order_id_to_cloid[order_id]
+                on_chain_by_cloid[cloid] = order
+                on_chain_order_ids.add(order_id)
 
-        # Check position change (as BPS of max_position)
-        if self.last_position_at_update is not None:
-            current_position = self.position_tracker.get_current_position()
-            position_change = abs(current_position - self.last_position_at_update)
-            position_change_bps = (position_change / self.bot_config.max_position) * 10000
+        # For each quoter, check if existing orders meet cancel threshold
+        for quoter in self.quoters:
+            # Get cancel thresholds (edges below which we cancel existing orders)
+            bid_cancel_edge, ask_cancel_edge = quoter.get_cancel_edges(self.bot_config.prop_maintain)
 
-            if position_change_bps >= self.bot_config.position_update_threshold_bps:
+            # Find existing orders for this quoter (by baseline_edge_bps in cloid)
+            quoter_prefix_bid = f"bid-{quoter.baseline_edge_bps}-"
+            quoter_prefix_ask = f"ask-{quoter.baseline_edge_bps}-"
+
+            existing_bid_cloid = None
+            existing_ask_cloid = None
+            need_bid = True
+            need_ask = True
+
+            # Check tracked orders for this quoter
+            for cloid in list(self.active_cloids):
+                if cloid.startswith(quoter_prefix_bid):
+                    existing_bid_cloid = cloid
+                elif cloid.startswith(quoter_prefix_ask):
+                    existing_ask_cloid = cloid
+
+            # Check bid: calculate edge and compare to cancel threshold
+            if existing_bid_cloid and existing_bid_cloid in on_chain_by_cloid:
+                order = on_chain_by_cloid[existing_bid_cloid]
+                order_price = float(order.get('price', 0)) / self.market_config.price_precision
+                order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
+
+                if order_edge >= bid_cancel_edge:
+                    # Edge is good, keep the order
+                    need_bid = False
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Keeping bid @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} >= cancel_threshold={bid_cancel_edge:.1f})"
+                    )
+                else:
+                    # Edge too low, cancel it
+                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling bid @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} < cancel_threshold={bid_cancel_edge:.1f})"
+                    )
+            elif existing_bid_cloid:
+                # Order doesn't exist on-chain anymore, don't try to cancel
+                need_bid = True
+
+            # Check ask: calculate edge and compare to cancel threshold
+            if existing_ask_cloid and existing_ask_cloid in on_chain_by_cloid:
+                order = on_chain_by_cloid[existing_ask_cloid]
+                order_price = float(order.get('price', 0)) / self.market_config.price_precision
+                order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
+
+                if order_edge >= ask_cancel_edge:
+                    # Edge is good, keep the order
+                    need_ask = False
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Keeping ask @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} >= cancel_threshold={ask_cancel_edge:.1f})"
+                    )
+                else:
+                    # Edge too low, cancel it
+                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling ask @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} < cancel_threshold={ask_cancel_edge:.1f})"
+                    )
+            elif existing_ask_cloid:
+                # Order doesn't exist on-chain anymore, don't try to cancel
+                need_ask = True
+
+            # Generate new orders for sides that need updating
+            new_quoter_orders = quoter.generate_orders(reference_price, need_bid=need_bid, need_ask=need_ask)
+            if new_quoter_orders:
+                all_orders.extend(new_quoter_orders)
+                total_new_orders += len(new_quoter_orders)
                 logger.debug(
-                    f"Update triggered by position change: {position_change:.2f} tokens "
-                    f"({position_change_bps:.2f} bps of max_position)"
+                    f"Quoter {quoter.baseline_edge_bps}bps: Generating {len(new_quoter_orders)} new orders "
+                    f"(bid={'yes' if need_bid else 'no'}, ask={'yes' if need_ask else 'no'})"
                 )
-                return True
 
-        return False
+        return all_orders, total_cancels, total_new_orders
+
+    async def _filter_orders_by_balance(self, orders: list[Order], on_chain_orders: list) -> list[Order]:
+        """
+        Filter orders to only include those we have sufficient balance for.
+
+        Args:
+            orders: List of orders (cancels + new orders)
+            on_chain_orders: Current on-chain orders
+
+        Returns:
+            Filtered list of orders we can afford
+        """
+        # Get current margin balances
+        base_wei, quote_wei = await self.client.user.get_margin_balances()
+        base_balance = base_wei / (10 ** self.market_config.base_token_decimals)
+        quote_balance = quote_wei / (10 ** self.market_config.quote_token_decimals)
+
+        # Calculate currently locked balances
+        locked_base = 0.0
+        locked_quote = 0.0
+        on_chain_by_cloid = {}
+
+        for order in on_chain_orders:
+            order_id = int(order.get('orderid', 0))
+            if order_id in self.order_id_to_cloid:
+                cloid = self.order_id_to_cloid[order_id]
+                on_chain_by_cloid[cloid] = order
+
+            is_buy = order.get("isbuy", False)
+            size = float(order.get("size", 0)) / self.market_config.size_precision
+            price = float(order.get("price", 0)) / self.market_config.price_precision
+
+            if is_buy:
+                locked_quote += size * price
+            else:
+                locked_base += size
+
+        # Start with current free balance
+        free_base = base_balance - locked_base
+        free_quote = quote_balance - locked_quote
+
+        logger.debug(f"Balance check: base_balance={base_balance:.2f}, quote_balance={quote_balance:.2f}")
+        logger.debug(f"Currently locked: base={locked_base:.2f}, quote={locked_quote:.2f}")
+        logger.debug(f"Currently free: base={free_base:.2f}, quote={free_quote:.2f}")
+
+        # Separate cancels and new orders
+        cancels = [o for o in orders if o.order_type == OrderType.CANCEL]
+        new_orders = [o for o in orders if o.order_type == OrderType.LIMIT]
+
+        # Add back balance from orders we're canceling
+        for cancel_order in cancels:
+            if cancel_order.cloid in on_chain_by_cloid:
+                order = on_chain_by_cloid[cancel_order.cloid]
+                is_buy = order.get("isbuy", False)
+                size = float(order.get("size", 0)) / self.market_config.size_precision
+                price = float(order.get("price", 0)) / self.market_config.price_precision
+
+                if is_buy:
+                    free_quote += size * price
+                    logger.debug(f"Cancel {cancel_order.cloid} frees {size * price:.2f} quote")
+                else:
+                    free_base += size
+                    logger.debug(f"Cancel {cancel_order.cloid} frees {size:.2f} base")
+
+        logger.debug(f"After cancels: free_base={free_base:.2f}, free_quote={free_quote:.2f}")
+
+        # Calculate required balances for new orders
+        required_base = 0.0
+        required_quote = 0.0
+        buy_orders = []
+        sell_orders = []
+
+        for order in new_orders:
+            if order.side == OrderSide.BUY:
+                buy_orders.append(order)
+                required_quote += order.size * order.price
+            elif order.side == OrderSide.SELL:
+                sell_orders.append(order)
+                required_base += order.size
+
+        logger.debug(f"New orders require: base={required_base:.2f}, quote={required_quote:.2f}")
+
+        # Filter orders based on available balance
+        filtered_orders = list(cancels)  # Always include cancels
+        skipped_buys = 0
+        skipped_sells = 0
+
+        # Add buy orders only if we have enough quote balance
+        if required_quote <= free_quote:
+            filtered_orders.extend(buy_orders)
+            logger.debug(f"✓ All {len(buy_orders)} buy orders can be placed")
+        else:
+            skipped_buys = len(buy_orders)
+            logger.warning(
+                f"⚠️  Insufficient quote balance for buy orders. "
+                f"Need {required_quote:.2f}, have {free_quote:.2f}. "
+                f"Skipping {skipped_buys} buy orders."
+            )
+
+        # Add sell orders only if we have enough base balance
+        if required_base <= free_base:
+            filtered_orders.extend(sell_orders)
+            logger.debug(f"✓ All {len(sell_orders)} sell orders can be placed")
+        else:
+            skipped_sells = len(sell_orders)
+            logger.warning(
+                f"⚠️  Insufficient base balance for sell orders. "
+                f"Need {required_base:.2f}, have {free_base:.2f}. "
+                f"Skipping {skipped_sells} sell orders."
+            )
+
+        if skipped_buys > 0 or skipped_sells > 0:
+            logger.info(
+                f"Balance filter: {len(filtered_orders)} orders kept "
+                f"({len(cancels)} cancels, {len(filtered_orders) - len(cancels)} new), "
+                f"{skipped_buys + skipped_sells} skipped"
+            )
+
+        return filtered_orders
 
     async def stop(self) -> None:
         """
@@ -946,6 +1135,23 @@ class Bot:
             logger.error(f"Error cancelling orders: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+        # Save position state before shutdown
+        if hasattr(self, 'position_tracker') and self.position_tracker:
+            try:
+                self.position_tracker.save_state()
+                total_pos = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
+                logger.info(f"💾 Position state saved: {total_pos:.2f}")
+            except Exception as e:
+                logger.error(f"Failed to save position state on shutdown: {e}")
+
+        # Stop Kuru WebSocket
+        if hasattr(self, 'kuru_price_source') and self.kuru_price_source:
+            try:
+                self.kuru_price_source.stop()
+                logger.success("✓ Kuru WebSocket stopped")
+            except Exception as e:
+                logger.error(f"Failed to stop Kuru WebSocket: {e}")
 
         # Stop client
         if self.client:

@@ -1,6 +1,7 @@
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
+import json
 from loguru import logger
 
 
@@ -27,6 +28,7 @@ class PositionTracker:
         debug_log_dir = Path("tracking")
         debug_log_dir.mkdir(exist_ok=True)
         self.debug_log_path = debug_log_dir / "position_tracker_debug.log"
+        self.state_file_path = debug_log_dir / "position_state.json"
 
         # Create/clear debug log file
         with open(self.debug_log_path, 'w') as f:
@@ -80,6 +82,9 @@ class PositionTracker:
 
         self._debug_log(f"[POSITION] New total position: {self.current_position + self.start_position:.2f}\n")
 
+        # Auto-save state after each position update
+        self.save_state()
+
 
     def get_current_position(self) -> float:
         """
@@ -107,3 +112,50 @@ class PositionTracker:
             Starting position
         """
         return self.start_position
+
+    def save_state(self) -> None:
+        """
+        Save position state to JSON file for persistence across restarts.
+        """
+        try:
+            state = {
+                'start_position': self.start_position,
+                'current_position': self.current_position,
+                'quote_position': self.quote_position,
+                'total_position': self.current_position + self.start_position,
+                'last_updated': datetime.now().isoformat()
+            }
+
+            with open(self.state_file_path, 'w') as f:
+                json.dump(state, f, indent=2)
+
+            logger.debug(f"Position state saved: position={state['total_position']:.2f}")
+        except Exception as e:
+            logger.error(f"Failed to save position state: {e}")
+
+    @classmethod
+    def load_state(cls, state_file_path: Path) -> Optional[dict]:
+        """
+        Load position state from JSON file.
+
+        Args:
+            state_file_path: Path to the state file
+
+        Returns:
+            Dict with state data, or None if file doesn't exist or is invalid
+        """
+        try:
+            if not state_file_path.exists():
+                logger.info("No saved position state found (first run)")
+                return None
+
+            with open(state_file_path, 'r') as f:
+                state = json.load(f)
+
+            logger.info(f"Loaded position state: position={state.get('total_position', 0):.2f}, "
+                       f"last_updated={state.get('last_updated', 'unknown')}")
+            return state
+        except Exception as e:
+            logger.error(f"Failed to load position state: {e}")
+            logger.warning("Starting with fresh position state")
+            return None
