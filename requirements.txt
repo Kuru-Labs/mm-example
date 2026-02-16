@@ -6,5 +6,5 @@ web3>=7.14.0
 websockets>=15.0.1
 aiohttp>=3.9.0
 
-# Note: This bot requires kuru-mm-python to be available locally
-# at ../kuru-mm-python or installed as kuru-mm-py package
+# Kuru SDK
+kuru-sdk-py>=0.1.2

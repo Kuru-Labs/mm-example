@@ -20,7 +20,7 @@ Each quoting level runs at a configured spread (in basis points). On each iterat
 ## Prerequisites
 
 - Python 3.10+
-- The `kuru-mm-python` package (see installation below)
+- The `kuru-sdk-py` package from PyPI
 
 ## Installation
 
@@ -32,24 +32,17 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-**2. Install the `kuru-mm-python` SDK:**
-
-If you have the SDK repo cloned locally at `../kuru-mm-python`:
-```bash
-pip install -e ../kuru-mm-python
-```
-
-Or install from PyPI (if available):
-```bash
-pip install kuru-mm-py
-```
-
-**3. Install bot dependencies:**
+**2. Install dependencies (includes `kuru-sdk-py` from PyPI):**
 ```bash
 pip install -r requirements.txt
 ```
 
-**4. Configure environment variables:**
+Or use the install script:
+```bash
+./install.sh
+```
+
+**3. Configure environment variables:**
 ```bash
 cp .env.example .env
 # Edit .env with your settings

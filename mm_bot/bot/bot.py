@@ -26,22 +26,24 @@ class OrderInfo:
 
 class Bot:
     """
-    Market making bot using the new kuru-mm-py SDK.
+    Market making bot using the kuru-sdk-py SDK.
 
     Uses event-driven callbacks for order tracking and unified place_orders() API
     for both cancellations and new order placement.
     """
 
-    def __init__(self, kuru_config, market_config, bot_config: BotConfig):
+    def __init__(self, connection_config, wallet_config, market_config, bot_config: BotConfig):
         """
         Initialize the bot.
 
         Args:
-            kuru_config: KuruMMConfig instance
+            connection_config: ConnectionConfig instance
+            wallet_config: WalletConfig instance
             market_config: MarketConfig instance
             bot_config: BotConfig instance
         """
-        self.kuru_config = kuru_config
+        self.connection_config = connection_config
+        self.wallet_config = wallet_config
         self.market_config = market_config
         self.bot_config = bot_config
 
@@ -313,10 +315,10 @@ class Bot:
         """
         # Create client using async factory
         logger.info("Creating KuruClient...")
-        # Use legacy kuru_mm_config parameter (will be split into connection + wallet configs)
         self.client = await KuruClient.create(
-            self.market_config,
-            kuru_mm_config=self.kuru_config
+            market_config=self.market_config,
+            connection_config=self.connection_config,
+            wallet_config=self.wallet_config,
         )
 
         # Set unified callback (handles both order tracking AND position updates)
