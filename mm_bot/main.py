@@ -66,8 +66,8 @@ async def main():
     sdk_level = log_level_map.get(sdk_log_level, logging.INFO)
 
     # Set log levels for various modules
-    logging.getLogger("src").setLevel(sdk_level)  # SDK modules
-    logging.getLogger("src.feed").setLevel(logging.ERROR)  # SDK feed module (very noisy warnings)
+    logging.getLogger("kuru_sdk_py").setLevel(sdk_level)  # SDK modules
+    logging.getLogger("kuru_sdk_py.feed").setLevel(logging.ERROR)  # SDK feed module (very noisy)
     logging.getLogger("urllib3").setLevel(logging.WARNING)  # HTTP library (very noisy)
     logging.getLogger("websockets").setLevel(logging.WARNING)  # WebSocket library
     logging.getLogger("asyncio").setLevel(logging.WARNING)  # Asyncio internals
@@ -77,6 +77,9 @@ async def main():
 
     # Set root logger to INFO to catch any other noisy DEBUG loggers
     logging.getLogger().setLevel(logging.INFO)
+
+    # Disable debug logs from noisy SDK modules using loguru
+    logger.disable("kuru_sdk_py.feed.rpc_ws")  # Completely disable the noisy feed logs
 
     logger.info(f"📝 Logging to file: {log_file}")
     logger.info(f"🔧 SDK log level: {sdk_log_level}")
