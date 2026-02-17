@@ -81,13 +81,20 @@ class Bot:
         # Initialize components (position tracker will be initialized in start())
         self.position_tracker: Optional[PositionTracker] = None
 
-        # Oracle service - using Coinbase for MON-USD price
+        # Oracle service - price source configured via ORACLE env var
         self.oracle_service = OracleService()
-        self.oracle_service.add_price_source("coinbase", CoinbasePriceSource("MON-USD"))
+        self.oracle_source = bot_config.oracle_source  # "kuru" or "coinbase"
 
-        # Kuru WebSocket price source (will be started in start() method)
-        self.kuru_price_source = KuruPriceSource()
-        self.oracle_service.add_price_source("kuru", self.kuru_price_source)
+        # Set up the configured price source
+        if self.oracle_source == "kuru":
+            # Kuru WebSocket price source (will be started in start() method)
+            self.kuru_price_source = KuruPriceSource()
+            self.oracle_service.add_price_source("kuru", self.kuru_price_source)
+        else:
+            # Coinbase API price source (default)
+            self.coinbase_price_source = CoinbasePriceSource(symbol="MON-USD")
+            self.oracle_service.add_price_source("coinbase", self.coinbase_price_source)
+            self.kuru_price_source = None  # Not used
 
         # PnL tracker (will be initialized after position tracker in start())
         self.pnl_tracker: Optional[PnlTracker] = None
@@ -331,9 +338,12 @@ class Bot:
         await self.client.start()
         logger.success(f"Connected to market: {self.market_config.market_symbol}")
 
-        # Start Kuru WebSocket price feed
-        logger.info("Connecting to Kuru orderbook WebSocket...")
-        self.kuru_price_source.start(self.market_config.market_address)
+        # Start price feed based on configured oracle
+        if self.oracle_source == "kuru":
+            logger.info("Connecting to Kuru orderbook WebSocket...")
+            self.kuru_price_source.start(self.market_config.market_address)
+        else:
+            logger.info(f"Using Coinbase API as oracle (symbol: MON-USD)")
 
         # ONE-TIME cleanup: Cancel any leftover orders from previous runs
         await self._cancel_all_existing_orders()
@@ -346,7 +356,7 @@ class Bot:
             position_tracker=self.position_tracker,
             oracle_service=self.oracle_service,
             market_id=self.market_config.market_address,
-            source_name="coinbase"
+            source_name="kuru"
         )
 
         # Create quoters with calculated quantity
@@ -437,7 +447,7 @@ class Bot:
             quoter = Quoter(
                 oracle_service=self.oracle_service,
                 position_tracker=self.position_tracker,
-                source_name="coinbase",
+                source_name="kuru",
                 market_id=self.market_config.market_address,
                 strategy_type=self.bot_config.strategy_type,
                 baseline_edge_bps=baseline_edge_bps,
@@ -585,7 +595,7 @@ class Bot:
                     ])
 
                 current_price = self.oracle_service.get_price(
-                    self.market_config.market_address, "coinbase"
+                    self.market_config.market_address, self.oracle_source
                 )
 
                 writer.writerow([
@@ -816,10 +826,10 @@ class Bot:
                     await self._cleanup_stale_preregistrations()
                     self.last_cleanup_time = time.time()
 
-                # Get reference price from Coinbase
+                # Get reference price from configured oracle
                 reference_price = self.oracle_service.get_price(
                     self.market_config.market_address,
-                    "coinbase"
+                    self.oracle_source
                 )
 
                 if reference_price is None:
@@ -918,12 +928,26 @@ class Bot:
             need_bid = True
             need_ask = True
 
-            # Check tracked orders for this quoter
+            # Primary: search active_cloids (callback-driven, no RPC lag).
+            # This is the reliable source - it's updated immediately when callbacks fire,
+            # unlike on_chain_by_cloid which requires RPC to reflect the mined block.
             for cloid in list(self.active_cloids):
                 if cloid.startswith(quoter_prefix_bid):
                     existing_bid_cloid = cloid
                 elif cloid.startswith(quoter_prefix_ask):
                     existing_ask_cloid = cloid
+
+            # Fallback: order just sent but ORDER_PLACED callback not yet received
+            if existing_bid_cloid is None:
+                for cloid in self.preregistered_orders:
+                    if cloid.startswith(quoter_prefix_bid):
+                        existing_bid_cloid = cloid
+                        break
+            if existing_ask_cloid is None:
+                for cloid in self.preregistered_orders:
+                    if cloid.startswith(quoter_prefix_ask):
+                        existing_ask_cloid = cloid
+                        break
 
             # Check bid: calculate edge and compare to cancel threshold
             if existing_bid_cloid and existing_bid_cloid in on_chain_by_cloid:
@@ -942,13 +966,22 @@ class Bot:
                     # Edge too low, cancel it
                     all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
                     total_cancels += 1
+                    # Proactively remove from active_cloids so the next iteration doesn't
+                    # find this stale cloid and mistakenly think the slot is still filled.
+                    self.active_cloids.discard(existing_bid_cloid)
                     logger.debug(
                         f"Quoter {quoter.baseline_edge_bps}bps: Cancelling bid @ {order_price:.6f} "
                         f"(edge={order_edge:.1f} < cancel_threshold={bid_cancel_edge:.1f})"
                     )
+            elif existing_bid_cloid and existing_bid_cloid in self.preregistered_orders:
+                # Order just sent, awaiting on-chain confirmation - don't place another
+                need_bid = False
+                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Bid pending confirmation, holding")
             elif existing_bid_cloid:
-                # Order doesn't exist on-chain anymore, don't try to cancel
-                need_bid = True
+                # In active_cloids but not in on_chain_by_cloid - likely API lag.
+                # Trust active_cloids (ORDER_PLACED callback = order IS on chain).
+                need_bid = False
+                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Bid in active_cloids (API lag?), holding")
 
             # Check ask: calculate edge and compare to cancel threshold
             if existing_ask_cloid and existing_ask_cloid in on_chain_by_cloid:
@@ -967,13 +1000,21 @@ class Bot:
                     # Edge too low, cancel it
                     all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
                     total_cancels += 1
+                    # Proactively remove from active_cloids (same reason as bid above)
+                    self.active_cloids.discard(existing_ask_cloid)
                     logger.debug(
                         f"Quoter {quoter.baseline_edge_bps}bps: Cancelling ask @ {order_price:.6f} "
                         f"(edge={order_edge:.1f} < cancel_threshold={ask_cancel_edge:.1f})"
                     )
+            elif existing_ask_cloid and existing_ask_cloid in self.preregistered_orders:
+                # Order just sent, awaiting on-chain confirmation - don't place another
+                need_ask = False
+                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Ask pending confirmation, holding")
             elif existing_ask_cloid:
-                # Order doesn't exist on-chain anymore, don't try to cancel
-                need_ask = True
+                # In active_cloids but not in on_chain_by_cloid - likely API lag.
+                # Trust active_cloids (ORDER_PLACED callback = order IS on chain).
+                need_ask = False
+                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Ask in active_cloids (API lag?), holding")
 
             # Generate new orders for sides that need updating
             new_quoter_orders = quoter.generate_orders(reference_price, need_bid=need_bid, need_ask=need_ask)
@@ -1003,39 +1044,26 @@ class Bot:
         base_balance = base_wei / (10 ** self.market_config.base_token_decimals)
         quote_balance = quote_wei / (10 ** self.market_config.quote_token_decimals)
 
-        # Calculate currently locked balances
-        locked_base = 0.0
-        locked_quote = 0.0
-        on_chain_by_cloid = {}
+        # Margin balance IS the free balance - tokens in margin are fully available.
+        # Existing orders have already been deducted from margin when they were placed.
+        free_base = base_balance
+        free_quote = quote_balance
 
+        logger.debug(f"Margin balance (free): base={free_base:.2f}, quote={free_quote:.2f}")
+
+        # Build cloid lookup for cancels
+        on_chain_by_cloid = {}
         for order in on_chain_orders:
             order_id = int(order.get('orderid', 0))
             if order_id in self.order_id_to_cloid:
                 cloid = self.order_id_to_cloid[order_id]
                 on_chain_by_cloid[cloid] = order
 
-            is_buy = order.get("isbuy", False)
-            size = float(order.get("size", 0)) / self.market_config.size_precision
-            price = float(order.get("price", 0)) / self.market_config.price_precision
-
-            if is_buy:
-                locked_quote += size * price
-            else:
-                locked_base += size
-
-        # Start with current free balance
-        free_base = base_balance - locked_base
-        free_quote = quote_balance - locked_quote
-
-        logger.debug(f"Balance check: base_balance={base_balance:.2f}, quote_balance={quote_balance:.2f}")
-        logger.debug(f"Currently locked: base={locked_base:.2f}, quote={locked_quote:.2f}")
-        logger.debug(f"Currently free: base={free_base:.2f}, quote={free_quote:.2f}")
-
         # Separate cancels and new orders
         cancels = [o for o in orders if o.order_type == OrderType.CANCEL]
         new_orders = [o for o in orders if o.order_type == OrderType.LIMIT]
 
-        # Add back balance from orders we're canceling
+        # Cancels return tokens to margin - add them to available balance
         for cancel_order in cancels:
             if cancel_order.cloid in on_chain_by_cloid:
                 order = on_chain_by_cloid[cancel_order.cloid]
@@ -1045,12 +1073,12 @@ class Bot:
 
                 if is_buy:
                     free_quote += size * price
-                    logger.debug(f"Cancel {cancel_order.cloid} frees {size * price:.2f} quote")
+                    logger.debug(f"Cancel {cancel_order.cloid} returns {size * price:.2f} quote to margin")
                 else:
                     free_base += size
-                    logger.debug(f"Cancel {cancel_order.cloid} frees {size:.2f} base")
+                    logger.debug(f"Cancel {cancel_order.cloid} returns {size:.2f} base to margin")
 
-        logger.debug(f"After cancels: free_base={free_base:.2f}, free_quote={free_quote:.2f}")
+        logger.debug(f"Available after cancels: base={free_base:.2f}, quote={free_quote:.2f}")
 
         # Calculate required balances for new orders
         required_base = 0.0

@@ -2,6 +2,7 @@ import asyncio
 import signal
 import logging
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
@@ -35,6 +36,14 @@ async def main():
     """
     Main entry point for the market making bot.
     """
+    # Configure loguru: remove default DEBUG console handler, replace with INFO
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format="{time:HH:mm:ss.SSS} | {level: <8} | {name}:{line} | {message}",
+        level="INFO",
+    )
+
     # Setup file logging
     log_dir = Path("tracking")
     log_dir.mkdir(exist_ok=True)
@@ -44,14 +53,14 @@ async def main():
     logger.add(
         log_file,
         format="{time:HH:mm:ss.SSS} | {level: <8} | {name}:{line} | {message}",
-        level="DEBUG",
+        level="INFO",
         rotation="50 MB",
         retention="7 days",
         compression="zip"
     )
 
     # Intercept standard library logging (used by SDK and other libraries)
-    logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
+    logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
 
     # Set SDK log level from environment variable
     # SDK_LOG_LEVEL options: DEBUG, INFO, WARNING, ERROR (default: INFO)

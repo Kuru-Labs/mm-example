@@ -19,6 +19,7 @@ class BotConfig:
     quantity_bps_per_level: Optional[float] = None  # If set, overrides quantity
     override_start_position: Optional[float] = None  # Manual position override
     reconcile_interval: float = 300  # Seconds between reconciliation (0=disabled)
+    oracle_source: str = "coinbase"  # "kuru" for Kuru orderbook mid, "coinbase" for Coinbase API
 
 
 def load_config_from_env():
@@ -70,7 +71,8 @@ def load_config_from_env():
         strategy_type=strategy_type,
         quantity_bps_per_level=quantity_bps_per_level,
         override_start_position=override_start_position,
-        reconcile_interval=float(os.getenv("RECONCILE_INTERVAL", "300"))
+        reconcile_interval=float(os.getenv("RECONCILE_INTERVAL", "300")),
+        oracle_source=os.getenv("ORACLE", "coinbase").lower()
     )
 
     return wallet_config, connection_config, market_config, bot_config
