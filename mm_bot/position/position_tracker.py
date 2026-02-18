@@ -37,7 +37,7 @@ class PositionTracker:
 
     def _debug_log(self, message: str) -> None:
         """Write to both logger and debug file."""
-        logger.warning(message)
+        logger.debug(message)
         with open(self.debug_log_path, 'a') as f:
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             f.write(f"[{timestamp}] {message}\n")

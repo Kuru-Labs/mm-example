@@ -36,12 +36,17 @@ async def main():
     """
     Main entry point for the market making bot.
     """
-    # Configure loguru: remove default DEBUG console handler, replace with INFO
+    # Load .env early so SDK_LOG_LEVEL and other vars are available before setup
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    # Configure loguru: remove default DEBUG console handler, replace with configured level
+    sdk_log_level = os.getenv("SDK_LOG_LEVEL", "INFO").upper()
     logger.remove()
     logger.add(
         sys.stderr,
         format="{time:HH:mm:ss.SSS} | {level: <8} | {name}:{line} | {message}",
-        level="INFO",
+        level=sdk_log_level,
     )
 
     # Setup file logging
@@ -53,7 +58,7 @@ async def main():
     logger.add(
         log_file,
         format="{time:HH:mm:ss.SSS} | {level: <8} | {name}:{line} | {message}",
-        level="INFO",
+        level=sdk_log_level,
         rotation="50 MB",
         retention="7 days",
         compression="zip"
@@ -64,7 +69,6 @@ async def main():
 
     # Set SDK log level from environment variable
     # SDK_LOG_LEVEL options: DEBUG, INFO, WARNING, ERROR (default: INFO)
-    sdk_log_level = os.getenv("SDK_LOG_LEVEL", "INFO").upper()
     log_level_map = {
         "DEBUG": logging.DEBUG,
         "INFO": logging.INFO,

@@ -106,7 +106,7 @@ class Bot:
 
     def _debug_log(self, message: str) -> None:
         """Write to both logger and debug file."""
-        logger.warning(message)
+        logger.debug(message)
         with open(self.debug_log_path, 'a') as f:
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             f.write(f"[{timestamp}] {message}\n")
@@ -869,7 +869,11 @@ class Bot:
                             self._debug_log(f"[PRESEND] Pre-registered {order.cloid} with size {order.size}")
 
                     # Single transaction for cancel + place
-                    txhash = await self.client.place_orders(all_orders, post_only=False)
+                    txhash = await self.client.place_orders(
+                        all_orders,
+                        post_only=False,
+                        price_rounding="default",
+                    )
                     logger.info(f"Transaction hash: {txhash}")
 
                     # Print PnL

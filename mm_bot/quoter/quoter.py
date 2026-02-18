@@ -44,35 +44,6 @@ class Quoter:
         """Cap a value between min_val and max_val"""
         return max(min_val, min(max_val, value))
 
-    def _round_to_tick(self, price: float) -> float:
-        """
-        Round price to valid tick size using integer arithmetic.
-
-        This avoids floating point precision errors by doing the rounding
-        in integer space (contract format) then converting back.
-        The SDK also applies tick rounding via price_rounding="default",
-        so this pre-alignment ensures consistency.
-        """
-        if not self.market_config:
-            # Fallback to simple rounding if no market config
-            return round(price, 6)
-
-        # Convert to contract integer format
-        price_int = int(round(price * self.market_config.price_precision))
-
-        # Round to nearest multiple of tick_size using ONLY integer arithmetic
-        tick_size = self.market_config.tick_size
-        aligned_int = ((price_int + tick_size // 2) // tick_size) * tick_size
-
-        # Convert back to human-readable float
-        aligned_price = aligned_int / self.market_config.price_precision
-
-        logger.debug(f"_round_to_tick: input={price:.10f}, price_int={price_int}, aligned_int={aligned_int}, output={aligned_price:.10f}")
-
-        # Ensure it's positive and non-zero
-        min_price = tick_size / self.market_config.price_precision
-        return max(aligned_price, min_price)
-
     def _calculate_prop_of_max_position(self) -> float:
         """Calculate the proportional position relative to max position, capped at [-1, 1]"""
         current_position = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
@@ -163,7 +134,8 @@ class Quoter:
         if need_bid:
             # Calculate bid price
             bid_multiplier = 1 - (bid_edge_bps / 10000)
-            bid_price = self._round_to_tick(reference_price * bid_multiplier)
+            # Tick rounding is delegated to SDK place_orders(price_rounding="default")
+            bid_price = reference_price * bid_multiplier
             bid_cloid = f"bid-{self.baseline_edge_bps}-{timestamp}"
 
             orders.append(Order(
@@ -174,11 +146,13 @@ class Quoter:
                 size=self.quantity,
                 post_only=False
             ))
+            logger.debug(f"New bid: cloid={bid_cloid} price={bid_price:.6f} size={self.quantity} edge={bid_edge_bps:.2f}bps")
 
         if need_ask:
             # Calculate ask price
             ask_multiplier = 1 + (ask_edge_bps / 10000)
-            ask_price = self._round_to_tick(reference_price * ask_multiplier)
+            # Tick rounding is delegated to SDK place_orders(price_rounding="default")
+            ask_price = reference_price * ask_multiplier
             ask_cloid = f"ask-{self.baseline_edge_bps}-{timestamp}"
 
             orders.append(Order(
@@ -189,6 +163,7 @@ class Quoter:
                 size=self.quantity,
                 post_only=False
             ))
+            logger.debug(f"New ask: cloid={ask_cloid} price={ask_price:.6f} size={self.quantity} edge={ask_edge_bps:.2f}bps")
 
         return orders
 
