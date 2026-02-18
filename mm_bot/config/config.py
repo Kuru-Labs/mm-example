@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 from dotenv import load_dotenv
 from mm_bot.kuru_imports import ConfigManager
-from mm_bot.quoter.quoter import StrategyType
 
 
 @dataclass
@@ -15,7 +14,6 @@ class BotConfig:
     quantity: float
     quoters_bps: List[float]
     prop_maintain: float  # Cancel threshold factor (0.2 = keep orders with edge >= 80% of target)
-    strategy_type: StrategyType = StrategyType.LONG
     quantity_bps_per_level: Optional[float] = None  # If set, overrides quantity
     override_start_position: Optional[float] = None  # Manual position override
     reconcile_interval: float = 300  # Seconds between reconciliation (0=disabled)
@@ -47,9 +45,6 @@ def load_config_from_env():
     quoters_bps_str = os.getenv("QUOTERS_BPS", "25,50,75")
     quoters_bps = [float(x.strip()) for x in quoters_bps_str.split(",")]
 
-    strategy_type_str = os.getenv("STRATEGY_TYPE", "long").lower()
-    strategy_type = StrategyType.LONG if strategy_type_str == "long" else StrategyType.SHORT
-
     # Load quantity (can be overridden by quantity_bps_per_level)
     quantity = float(os.getenv("QUANTITY", "100"))
 
@@ -68,7 +63,6 @@ def load_config_from_env():
         quantity=quantity,
         quoters_bps=quoters_bps,
         prop_maintain=float(os.getenv("PROP_MAINTAIN", "0.2")),
-        strategy_type=strategy_type,
         quantity_bps_per_level=quantity_bps_per_level,
         override_start_position=override_start_position,
         reconcile_interval=float(os.getenv("RECONCILE_INTERVAL", "300")),

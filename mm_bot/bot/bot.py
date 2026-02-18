@@ -449,7 +449,6 @@ class Bot:
                 position_tracker=self.position_tracker,
                 source_name="kuru",
                 market_id=self.market_config.market_address,
-                strategy_type=self.bot_config.strategy_type,
                 baseline_edge_bps=baseline_edge_bps,
                 max_position=self.bot_config.max_position,
                 prop_skew_entry=self.bot_config.prop_skew_entry,

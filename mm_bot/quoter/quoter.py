@@ -1,4 +1,3 @@
-from enum import Enum
 from typing import Optional
 import time
 from loguru import logger
@@ -8,11 +7,6 @@ from mm_bot.position.position_tracker import PositionTracker
 from mm_bot.kuru_imports import Order, OrderType, OrderSide
 
 
-class StrategyType(Enum):
-    LONG = "long"
-    SHORT = "short"
-
-
 class Quoter:
     def __init__(
         self,
@@ -20,7 +14,6 @@ class Quoter:
         position_tracker: PositionTracker,
         source_name: str,
         market_id: str,
-        strategy_type: StrategyType,
         baseline_edge_bps: float,
         max_position: float,
         prop_skew_entry: float,
@@ -32,7 +25,6 @@ class Quoter:
         self.position_tracker = position_tracker
         self.source_name = source_name
         self.market_id = market_id
-        self.strategy_type = strategy_type
         self.baseline_edge_bps = baseline_edge_bps
         self.max_position = max_position
         self.prop_skew_entry = prop_skew_entry
@@ -59,10 +51,12 @@ class Quoter:
         """
         prop_of_max = self._calculate_prop_of_max_position()
 
-        if self.strategy_type == StrategyType.LONG:
+        if prop_of_max > 0:
+            # Currently long: widen asks, tighten bids to mean-revert
             bid_edge_bps = self.baseline_edge_bps * (1 + prop_of_max * self.prop_skew_entry)
             ask_edge_bps = self.baseline_edge_bps * (1 - prop_of_max * self.prop_skew_exit)
         else:
+            # Currently short: widen bids, tighten asks to mean-revert
             bid_edge_bps = self.baseline_edge_bps * (1 - prop_of_max * self.prop_skew_exit)
             ask_edge_bps = self.baseline_edge_bps * (1 + prop_of_max * self.prop_skew_entry)
 

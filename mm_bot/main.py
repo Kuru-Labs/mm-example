@@ -105,7 +105,6 @@ async def main():
     logger.info(f"Max Position: {bot_config.max_position}")
     logger.info(f"Quantity per order: {bot_config.quantity}")
     logger.info(f"Quoters (bps): {bot_config.quoters_bps}")
-    logger.info(f"Strategy: {bot_config.strategy_type.value}")
 
     # Create bot
     bot = Bot(connection_config, wallet_config, market_config, bot_config)
