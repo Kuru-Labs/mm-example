@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
-from mm_bot.kuru_imports import KuruClient, Order, OrderType, OrderStatus, OrderSide
+from mm_bot.kuru_imports import KuruClient, Order, OrderType, OrderStatus, OrderSide, ConfigManager
 from mm_bot.config.config import BotConfig
 from mm_bot.quoter.quoter import Quoter
 from mm_bot.position.position_tracker import PositionTracker
@@ -74,6 +74,9 @@ class Bot:
 
         # Orphaned order tracking (orders on chain but no callback received)
         self.orphaned_order_timestamps: Dict[int, float] = {}  # order_id → first_seen_timestamp
+
+        # Recently cancelled order IDs (cancel callback received but REST API still shows them)
+        self.recently_cancelled_order_ids: Dict[int, float] = {}  # order_id → cancel_timestamp
 
         # Validation counter for periodic API checks
         self._validation_counter: int = 0
@@ -181,6 +184,7 @@ class Bot:
             # Clean up mapping
             if order.cloid in self.cloid_to_order_id:
                 order_id = self.cloid_to_order_id[order.cloid]
+                self.recently_cancelled_order_ids[order_id] = time.monotonic()
                 del self.cloid_to_order_id[order.cloid]
                 del self.order_id_to_cloid[order_id]
             # Clean up size tracking
@@ -205,10 +209,13 @@ class Bot:
             source = None
 
             if order.cloid in self.order_sizes:
-                # Normal path: ORDER_PLACED fired before fill
+                # Normal path: ORDER_PLACED fired before fill (or immediate fill via PRESEND)
                 previous_size = self.order_sizes[order.cloid]
                 source = "order_sizes"
                 del self.order_sizes[order.cloid]
+                # If ORDER_PLACED never fired (immediate fill), preregistered_orders still has
+                # this cloid (both were set together at PRESEND). Clean it up now.
+                self.preregistered_orders.pop(order.cloid, None)
             elif order.cloid in self.preregistered_orders:
                 # Immediate fill path: ORDER_PLACED never fired
                 previous_size = self.preregistered_orders[order.cloid][0]
@@ -326,6 +333,7 @@ class Bot:
             market_config=self.market_config,
             connection_config=self.connection_config,
             wallet_config=self.wallet_config,
+            transaction_config=ConfigManager.load_transaction_config(),
         )
 
         # Set unified callback (handles both order tracking AND position updates)
@@ -650,8 +658,16 @@ class Bot:
             tracked_order_ids = {info.order_id for info in self.active_orders.values()}
             missing_in_tracked = api_order_ids - tracked_order_ids
 
-            current_time = time.time()
+            current_time = time.monotonic()
             orphan_timeout = 3.0  # seconds - grace period for late callbacks
+
+            # Prune recently_cancelled_order_ids entries older than 5s
+            self.recently_cancelled_order_ids = {
+                oid: ts for oid, ts in self.recently_cancelled_order_ids.items()
+                if current_time - ts <= 5.0
+            }
+            # Filter out orders we know we cancelled — API lag, not lost callbacks
+            missing_in_tracked -= self.recently_cancelled_order_ids.keys()
 
             if missing_in_tracked:
                 # Track when we first saw these orphaned orders
@@ -980,11 +996,29 @@ class Bot:
                 # Order just sent, awaiting on-chain confirmation - don't place another
                 need_bid = False
                 logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Bid pending confirmation, holding")
+            elif existing_bid_cloid and existing_bid_cloid in self.active_orders:
+                # Confirmed on-chain (ORDER_PLACED received) but REST API hasn't indexed it yet.
+                # Use callback-tracked price for full edge evaluation — eliminates the blind window.
+                order_price = self.active_orders[existing_bid_cloid].price
+                order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
+                if order_edge >= bid_cancel_edge:
+                    need_bid = False
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Keeping bid @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} >= cancel_threshold={bid_cancel_edge:.1f}) [callback]"
+                    )
+                else:
+                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_bid_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling bid @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} < cancel_threshold={bid_cancel_edge:.1f}) [callback]"
+                    )
             elif existing_bid_cloid:
-                # In active_cloids but not in on_chain_by_cloid - likely API lag.
-                # Trust active_cloids (ORDER_PLACED callback = order IS on chain).
+                # In active_cloids but not in active_orders — unexpected state, hold.
                 need_bid = False
-                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Bid in active_cloids (API lag?), holding")
+                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Bid in unknown state, holding")
 
             # Check ask: calculate edge and compare to cancel threshold
             if existing_ask_cloid and existing_ask_cloid in on_chain_by_cloid:
@@ -1013,11 +1047,54 @@ class Bot:
                 # Order just sent, awaiting on-chain confirmation - don't place another
                 need_ask = False
                 logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Ask pending confirmation, holding")
+            elif existing_ask_cloid and existing_ask_cloid in self.active_orders:
+                # Confirmed on-chain (ORDER_PLACED received) but REST API hasn't indexed it yet.
+                # Use callback-tracked price for full edge evaluation — eliminates the blind window.
+                order_price = self.active_orders[existing_ask_cloid].price
+                order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
+                if order_edge >= ask_cancel_edge:
+                    need_ask = False
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Keeping ask @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} >= cancel_threshold={ask_cancel_edge:.1f}) [callback]"
+                    )
+                else:
+                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_ask_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling ask @ {order_price:.6f} "
+                        f"(edge={order_edge:.1f} < cancel_threshold={ask_cancel_edge:.1f}) [callback]"
+                    )
             elif existing_ask_cloid:
-                # In active_cloids but not in on_chain_by_cloid - likely API lag.
-                # Trust active_cloids (ORDER_PLACED callback = order IS on chain).
+                # In active_cloids but not in active_orders — unexpected state, hold.
                 need_ask = False
-                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Ask in active_cloids (API lag?), holding")
+                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Ask in unknown state, holding")
+
+            # Coupling block: if one side needs replacement, force-replace the other too.
+            # This ensures both sides are re-priced with the current prop_of_max after a fill.
+            if need_bid and not need_ask:
+                # Bid is being replaced. Check if ask is still preregistered (mid-block race).
+                if existing_ask_cloid and existing_ask_cloid in self.preregistered_orders:
+                    logger.debug(f"Coupling: ask {existing_ask_cloid} still preregistered, skipping quoter this iteration")
+                    continue
+                need_ask = True
+                if existing_ask_cloid:
+                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_ask_cloid)
+                    logger.debug(f"Coupling: cancelling ask {existing_ask_cloid} because bid was replaced")
+            elif need_ask and not need_bid:
+                # Ask is being replaced. Check if bid is still preregistered (mid-block race).
+                if existing_bid_cloid and existing_bid_cloid in self.preregistered_orders:
+                    logger.debug(f"Coupling: bid {existing_bid_cloid} still preregistered, skipping quoter this iteration")
+                    continue
+                need_bid = True
+                if existing_bid_cloid:
+                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_bid_cloid)
+                    logger.debug(f"Coupling: cancelling bid {existing_bid_cloid} because ask was replaced")
 
             # Generate new orders for sides that need updating
             new_quoter_orders = quoter.generate_orders(reference_price, need_bid=need_bid, need_ask=need_ask)
