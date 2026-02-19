@@ -1220,29 +1220,32 @@ class Bot:
         """
         logger.info("\n🛑 Stopping bot...")
 
-        # Cancel all active orders using cancel_all (more reliable than individual cancels)
+        # Cancel all active orders with exponential backoff until REST API confirms empty
         try:
-            # Check if there are any orders to cancel
-            active_orders = self.client.user.get_active_orders()
-            if active_orders:
-                logger.info(f"Cancelling {len(active_orders)} active orders...")
-                cancel_tx = await self.client.cancel_all_active_orders_for_market()
-                logger.success(f"✓ Sent cancel transaction: {cancel_tx}")
+            delay = 1.0
+            attempt = 0
+            while True:
+                active_orders = self.client.user.get_active_orders()
+                if not active_orders:
+                    if attempt == 0:
+                        logger.info("No active orders to cancel")
+                    else:
+                        logger.success("✓ All orders cancelled successfully")
+                    break
 
-                # Wait a moment for cancel transaction to confirm
-                logger.info("Waiting for cancellation to confirm...")
-                await asyncio.sleep(3)
+                attempt += 1
+                logger.info(f"Cancelling {len(active_orders)} active orders (attempt {attempt})...")
+                try:
+                    cancel_tx = await self.client.cancel_all_active_orders_for_market()
+                    logger.success(f"✓ Sent cancel transaction: {cancel_tx}")
+                except Exception as cancel_err:
+                    logger.warning(f"Cancel attempt {attempt} failed: {cancel_err}")
 
-                # Verify cancellation
-                remaining = self.client.user.get_active_orders()
-                if remaining:
-                    logger.warning(f"⚠️ {len(remaining)} orders still active after cancellation")
-                else:
-                    logger.success("✓ All orders cancelled successfully")
-            else:
-                logger.info("No active orders to cancel")
+                logger.info(f"Waiting {delay:.0f}s for cancellation to confirm...")
+                await asyncio.sleep(delay)
+                delay *= 2
         except Exception as e:
-            logger.error(f"Error cancelling orders: {e}")
+            logger.error(f"Error during order cancellation: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
