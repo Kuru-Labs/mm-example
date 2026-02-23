@@ -962,6 +962,16 @@ class Bot:
         total_cancels = 0
         total_new_orders = 0
 
+        # Check position limits for one-sided quoting
+        current_position = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
+        stop_bids = current_position > self.bot_config.max_position
+        stop_asks = current_position < -self.bot_config.max_position
+        
+        if stop_bids:
+            logger.debug(f"Position {current_position:.2f} > MAX_POSITION {self.bot_config.max_position:.2f} - STOPPING BID QUOTES")
+        if stop_asks:
+            logger.debug(f"Position {current_position:.2f} < -MAX_POSITION {-self.bot_config.max_position:.2f} - STOPPING ASK QUOTES")
+
         # Build map of on-chain orders by cloid (for our orders only)
         on_chain_by_cloid = {}
         on_chain_order_ids = set()
@@ -1014,7 +1024,16 @@ class Bot:
                 order_price = float(order.get('price', 0)) / self.market_config.price_precision
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
 
-                if order_edge >= bid_cancel_edge:
+                # Cancel bid if position limit exceeded
+                if stop_bids:
+                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_bid_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling bid @ {order_price:.6f} "
+                        f"(position limit exceeded)"
+                    )
+                elif order_edge >= bid_cancel_edge:
                     # Edge is good, keep the order
                     need_bid = False
                     logger.debug(
@@ -1041,7 +1060,17 @@ class Bot:
                 # Use callback-tracked price for full edge evaluation — eliminates the blind window.
                 order_price = self.active_orders[existing_bid_cloid].price
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
-                if order_edge >= bid_cancel_edge:
+                
+                # Cancel bid if position limit exceeded
+                if stop_bids:
+                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_bid_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling bid @ {order_price:.6f} "
+                        f"(position limit exceeded) [callback]"
+                    )
+                elif order_edge >= bid_cancel_edge:
                     need_bid = False
                     logger.debug(
                         f"Quoter {quoter.baseline_edge_bps}bps: Keeping bid @ {order_price:.6f} "
@@ -1066,7 +1095,16 @@ class Bot:
                 order_price = float(order.get('price', 0)) / self.market_config.price_precision
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
 
-                if order_edge >= ask_cancel_edge:
+                # Cancel ask if position limit exceeded
+                if stop_asks:
+                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_ask_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling ask @ {order_price:.6f} "
+                        f"(position limit exceeded)"
+                    )
+                elif order_edge >= ask_cancel_edge:
                     # Edge is good, keep the order
                     need_ask = False
                     logger.debug(
@@ -1092,7 +1130,17 @@ class Bot:
                 # Use callback-tracked price for full edge evaluation — eliminates the blind window.
                 order_price = self.active_orders[existing_ask_cloid].price
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
-                if order_edge >= ask_cancel_edge:
+                
+                # Cancel ask if position limit exceeded
+                if stop_asks:
+                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_ask_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling ask @ {order_price:.6f} "
+                        f"(position limit exceeded) [callback]"
+                    )
+                elif order_edge >= ask_cancel_edge:
                     need_ask = False
                     logger.debug(
                         f"Quoter {quoter.baseline_edge_bps}bps: Keeping ask @ {order_price:.6f} "
@@ -1137,13 +1185,17 @@ class Bot:
                     logger.debug(f"Coupling: cancelling bid {existing_bid_cloid} because ask was replaced")
 
             # Generate new orders for sides that need updating
-            new_quoter_orders = quoter.generate_orders(reference_price, need_bid=need_bid, need_ask=need_ask)
+            # Apply position limits: stop quoting bids if position > max, stop asks if position < -max
+            final_need_bid = need_bid and not stop_bids
+            final_need_ask = need_ask and not stop_asks
+            
+            new_quoter_orders = quoter.generate_orders(reference_price, need_bid=final_need_bid, need_ask=final_need_ask)
             if new_quoter_orders:
                 all_orders.extend(new_quoter_orders)
                 total_new_orders += len(new_quoter_orders)
                 logger.debug(
                     f"Quoter {quoter.baseline_edge_bps}bps: Generating {len(new_quoter_orders)} new orders "
-                    f"(bid={'yes' if need_bid else 'no'}, ask={'yes' if need_ask else 'no'})"
+                    f"(bid={'yes' if final_need_bid else 'no'}, ask={'yes' if final_need_ask else 'no'})"
                 )
 
         return all_orders, total_cancels, total_new_orders
