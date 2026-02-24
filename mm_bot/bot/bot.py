@@ -33,17 +33,19 @@ class Bot:
     for both cancellations and new order placement.
     """
 
-    def __init__(self, connection_config, wallet_config, market_config, bot_config: BotConfig):
+    def __init__(self, connection_config, cache_config, wallet_config, market_config, bot_config: BotConfig):
         """
         Initialize the bot.
 
         Args:
             connection_config: ConnectionConfig instance
+            cache_config: CacheConfig instance
             wallet_config: WalletConfig instance
             market_config: MarketConfig instance
             bot_config: BotConfig instance
         """
         self.connection_config = connection_config
+        self.cache_config = cache_config
         self.wallet_config = wallet_config
         self.market_config = market_config
         self.bot_config = bot_config
@@ -387,6 +389,7 @@ class Bot:
         logger.info("Creating KuruClient...")
         self.client = await KuruClient.create(
             market_config=self.market_config,
+            cache_config=self.cache_config,
             connection_config=self.connection_config,
             wallet_config=self.wallet_config,
             transaction_config=ConfigManager.load_transaction_config(),
