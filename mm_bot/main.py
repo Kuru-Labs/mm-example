@@ -99,7 +99,6 @@ async def main():
 
     # Load configuration
     logger.info("Loading configuration...")
-<<<<<<< HEAD
 
     # Load operational config from TOML (with .env fallback)
     config_path = Path("bot_config.toml")
