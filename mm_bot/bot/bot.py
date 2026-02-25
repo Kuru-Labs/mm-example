@@ -70,6 +70,9 @@ class Bot:
         # Pre-registration for immediate fills (orders sent but not yet confirmed)
         self.preregistered_orders: Dict[str, tuple[float, float]] = {}  # cloid → (size, timestamp)
 
+        # Per-order cleanup tasks (cancelled when callback arrives)
+        self._prereg_cleanup_tasks: Dict[str, asyncio.Task] = {}  # cloid → cleanup Task
+
         # Active orders tracked from callbacks (for inventory, no API calls needed)
         self.active_orders: Dict[str, OrderInfo] = {}  # cloid → OrderInfo
 
@@ -159,6 +162,7 @@ class Bot:
             # Confirm pre-registration (if order was pre-registered)
             if order.cloid in self.preregistered_orders:
                 del self.preregistered_orders[order.cloid]
+                self._cancel_prereg_cleanup(order.cloid)
                 self._debug_log(f"[ORDER] PLACED - {order.cloid} confirmed (was pre-registered)")
 
             # Store initial size for fill calculation (if not already there from pre-reg)
@@ -188,6 +192,7 @@ class Bot:
         # Track cancellations
         elif order.status == OrderStatus.ORDER_CANCELLED:
             self.active_cloids.discard(order.cloid)
+            self._cancel_prereg_cleanup(order.cloid)
             # Clean up mapping
             if order.cloid in self.cloid_to_order_id:
                 order_id = self.cloid_to_order_id[order.cloid]
@@ -206,10 +211,23 @@ class Bot:
 
         # Track fills and update position
         elif order.status == OrderStatus.ORDER_FULLY_FILLED:
+            self._cancel_prereg_cleanup(order.cloid)
+
+            # Infer side from cloid prefix when SDK returns None
+            fill_side = order.side
+            if fill_side is None:
+                from mm_bot.kuru_imports import OrderSide
+                if order.cloid and order.cloid.startswith('bid-'):
+                    fill_side = OrderSide.BUY
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred BUY from cloid prefix")
+                elif order.cloid and order.cloid.startswith('ask-'):
+                    fill_side = OrderSide.SELL
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred SELL from cloid prefix")
+
             self._debug_log(f"[ORDER] FULLY_FILLED event - cloid: {order.cloid}")
-            self._debug_log(f"[ORDER]   side: {order.side.value if order.side else 'None'}")
+            self._debug_log(f"[ORDER]   side: {fill_side.value if fill_side else 'None'}")
             self._debug_log(f"[ORDER]   remaining size: {order.size:.2f}")
-            self._debug_log(f"[ORDER]   price: {order.price:.6f}")
+            self._debug_log(f"[ORDER]   price: {order.price if order.price is not None else 'None'}")
 
             # Calculate filled size - check both order_sizes and preregistered_orders
             previous_size = None
@@ -229,29 +247,42 @@ class Bot:
                 source = "preregistered"
                 del self.preregistered_orders[order.cloid]
 
-            if previous_size is not None:
+            if previous_size is not None and fill_side is not None:
                 filled_size = previous_size - order.size  # order.size should be 0 for fully filled
 
                 self._debug_log(f"[ORDER]   previous size: {previous_size:.2f} (from {source})")
                 self._debug_log(f"[ORDER]   FILLED SIZE: {filled_size:.2f}")
 
+                # Use order.price if available, otherwise log warning (still track position)
+                fill_price = order.price if order.price is not None else 0.0
+                if order.price is None:
+                    self._debug_log(f"[ORDER] ⚠️ price was None, using 0.0 for quote tracking (position still updated)")
+
                 # Update position tracker with actual filled amount
                 self.position_tracker.update_position(
-                    side=order.side,
+                    side=fill_side,
                     filled_size=filled_size,
-                    price=order.price
+                    price=fill_price
                 )
 
                 # SUCCESS
                 self._debug_log(f"[ORDER] Position tracker updated successfully\n")
 
+            elif previous_size is not None and fill_side is None:
+                # Have the size but can't determine side — critical error
+                self._debug_log(f"[ORDER] ⚠️ SKIPPED - Could not determine side for {order.cloid}!")
+                self._debug_log(f"[ORDER] Position NOT updated for {order.cloid}\n")
+                logger.error(
+                    f"⚠️ Fill for {order.cloid}: side is None and could not be inferred - "
+                    f"POSITION NOT UPDATED!"
+                )
             else:
                 # FAILURE - not in either dict
                 self._debug_log(f"[ORDER] ⚠️ SKIPPED - Order not in order_sizes or preregistered!")
                 self._debug_log(f"[ORDER] Position NOT updated for {order.cloid}\n")
                 logger.error(
                     f"⚠️ Fill received for unknown order: {order.cloid} "
-                    f"(side: {order.side.value if order.side else 'N/A'}, "
+                    f"(side: {fill_side.value if fill_side else 'N/A'}, "
                     f"size: {order.size}) - POSITION NOT UPDATED!"
                 )
 
@@ -269,15 +300,29 @@ class Bot:
 
             logger.success(
                 f"✓ Order {order.cloid} filled! "
-                f"Side: {order.side.value if order.side else 'N/A'}, "
+                f"Side: {fill_side.value if fill_side else 'N/A'}, "
                 f"Price: {order.price}"
             )
 
         elif order.status == OrderStatus.ORDER_PARTIALLY_FILLED:
+            # Cancel cleanup task (order is confirmed on-chain via partial fill)
+            self._cancel_prereg_cleanup(order.cloid)
+
+            # Infer side from cloid prefix when SDK returns None
+            fill_side = order.side
+            if fill_side is None:
+                from mm_bot.kuru_imports import OrderSide
+                if order.cloid and order.cloid.startswith('bid-'):
+                    fill_side = OrderSide.BUY
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred BUY from cloid prefix")
+                elif order.cloid and order.cloid.startswith('ask-'):
+                    fill_side = OrderSide.SELL
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred SELL from cloid prefix")
+
             self._debug_log(f"[ORDER] PARTIALLY_FILLED event - cloid: {order.cloid}")
-            self._debug_log(f"[ORDER]   side: {order.side.value if order.side else 'None'}")
+            self._debug_log(f"[ORDER]   side: {fill_side.value if fill_side else 'None'}")
             self._debug_log(f"[ORDER]   remaining size: {order.size:.2f}")
-            self._debug_log(f"[ORDER]   price: {order.price:.6f}")
+            self._debug_log(f"[ORDER]   price: {order.price if order.price is not None else 'None'}")
 
             # Calculate filled size - check both order_sizes and preregistered_orders
             previous_size = None
@@ -293,17 +338,21 @@ class Bot:
                 self.order_sizes[order.cloid] = order.size
                 del self.preregistered_orders[order.cloid]
 
-            if previous_size is not None:
+            if previous_size is not None and fill_side is not None:
                 filled_size = previous_size - order.size
 
                 self._debug_log(f"[ORDER]   previous size: {previous_size:.2f} (from {source})")
                 self._debug_log(f"[ORDER]   FILLED SIZE: {filled_size:.2f}")
 
+                fill_price = order.price if order.price is not None else 0.0
+                if order.price is None:
+                    self._debug_log(f"[ORDER] ⚠️ price was None, using 0.0 for quote tracking (position still updated)")
+
                 # Update position tracker with actual filled amount
                 self.position_tracker.update_position(
-                    side=order.side,
+                    side=fill_side,
                     filled_size=filled_size,
-                    price=order.price
+                    price=fill_price
                 )
 
                 # Update stored size for next partial fill
@@ -323,7 +372,7 @@ class Bot:
                 self._debug_log(f"[ORDER] Position NOT updated for {order.cloid}\n")
                 logger.error(
                     f"⚠️ Partial fill received for unknown order: {order.cloid} "
-                    f"(side: {order.side.value if order.side else 'N/A'}, "
+                    f"(side: {fill_side.value if fill_side else 'N/A'}, "
                     f"remaining: {order.size}) - POSITION NOT UPDATED!"
                 )
 
@@ -803,34 +852,41 @@ class Bot:
             import traceback
             logger.error(traceback.format_exc())
 
-    async def _cleanup_stale_preregistrations(self) -> None:
+    def _schedule_prereg_cleanup(self, cloid: str, timeout: float = 30.0) -> None:
         """
-        Clean up pre-registered orders that never received confirmation.
-        Call this periodically (e.g., every 30 seconds).
+        Schedule a per-order cleanup task that fires after `timeout` seconds.
+        If a callback (ORDER_PLACED, CANCELLED, FILLED) arrives before the timeout,
+        the task is cancelled via _cancel_prereg_cleanup().
+
+        Only removes from preregistered_orders — NEVER from order_sizes,
+        which is the safety net for position tracking on late fills.
         """
-        try:
-            current_time = time.time()
-            stale_timeout = 5  # seconds (short timeout since transactions are fast)
+        async def _cleanup_after_timeout():
+            try:
+                await asyncio.sleep(timeout)
+                # Timeout reached — no callback arrived in time
+                if cloid in self.preregistered_orders:
+                    del self.preregistered_orders[cloid]
+                    logger.warning(
+                        f"⚠️ Cleaned up stale pre-registration for {cloid} "
+                        f"(no confirmation after {timeout}s)"
+                    )
+                    self._debug_log(f"[CLEANUP] Removed stale pre-registration: {cloid}")
+                # NOTE: order_sizes is intentionally kept so late fills are still tracked
+            except asyncio.CancelledError:
+                pass  # Callback arrived, cleanup cancelled — this is the happy path
+            finally:
+                self._prereg_cleanup_tasks.pop(cloid, None)
 
-            stale_cloids = []
-            for cloid, (_, timestamp) in self.preregistered_orders.items():
-                age = current_time - timestamp
-                if age > stale_timeout:
-                    stale_cloids.append(cloid)
+        # Cancel any existing cleanup task for this cloid (shouldn't happen, but be safe)
+        self._cancel_prereg_cleanup(cloid)
+        self._prereg_cleanup_tasks[cloid] = asyncio.create_task(_cleanup_after_timeout())
 
-            for cloid in stale_cloids:
-                # Remove from order_sizes (order never confirmed)
-                if cloid in self.order_sizes:
-                    del self.order_sizes[cloid]
-                del self.preregistered_orders[cloid]
-                logger.warning(
-                    f"⚠️ Cleaned up stale pre-registration for {cloid} "
-                    f"(no confirmation after {stale_timeout}s)"
-                )
-                self._debug_log(f"[CLEANUP] Removed stale pre-registration: {cloid}")
-
-        except Exception as e:
-            logger.error(f"Failed to cleanup stale pre-registrations: {e}")
+    def _cancel_prereg_cleanup(self, cloid: str) -> None:
+        """Cancel the per-order cleanup task when a callback arrives."""
+        task = self._prereg_cleanup_tasks.pop(cloid, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _cancel_all_existing_orders(self) -> None:
         """
@@ -857,7 +913,6 @@ class Bot:
         logger.info("🚀 Starting market making loop...\n")
         iteration = 0
         self.last_reconcile_time = time.time()
-        self.last_cleanup_time = time.time()
 
         while not self.shutdown_event.is_set():
             try:
@@ -875,12 +930,6 @@ class Bot:
                         await self._reconcile_position()
                         self.last_reconcile_time = time.time()
 
-                # Periodic cleanup of stale pre-registrations (every 5 seconds)
-                cleanup_interval = 5.0
-                if time.time() - self.last_cleanup_time >= cleanup_interval:
-                    await self._cleanup_stale_preregistrations()
-                    self.last_cleanup_time = time.time()
-
                 # Get reference price from configured oracle
                 reference_price = self.oracle_service.get_price(
                     self.market_config.market_address,
@@ -892,7 +941,7 @@ class Bot:
                     await asyncio.sleep(1.0)
                     continue
 
-                logger.info(f"Iteration {iteration}: Price=${reference_price:.5f}")
+                logger.debug(f"Iteration {iteration}: Price=${reference_price:.5f}")
 
                 # Get current on-chain active orders
                 on_chain_orders = self.client.user.get_active_orders()
@@ -902,7 +951,7 @@ class Bot:
                     reference_price, on_chain_orders
                 )
 
-                logger.info(f"PropMaintain: {num_cancels} cancels, {num_new_orders} new orders")
+                logger.debug(f"PropMaintain: {num_cancels} cancels, {num_new_orders} new orders")
 
                 # Validate balance before placing orders
                 if all_orders:
@@ -921,6 +970,7 @@ class Bot:
                             # Skip cancels, only pre-register new limit orders
                             self.preregistered_orders[order.cloid] = (order.size, time.time())
                             self.order_sizes[order.cloid] = order.size
+                            self._schedule_prereg_cleanup(order.cloid, timeout=30.0)
                             self._debug_log(f"[PRESEND] Pre-registered {order.cloid} with size {order.size}")
 
                     # Single transaction for cancel + place
