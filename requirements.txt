@@ -8,3 +8,6 @@ aiohttp>=3.9.0
 
 # Kuru SDK
 kuru-sdk-py>=0.1.3
+
+# Configuration hot-reload
+tomli>=2.0.0; python_version < '3.11'

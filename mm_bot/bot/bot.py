@@ -8,6 +8,7 @@ from loguru import logger
 
 from mm_bot.kuru_imports import KuruClient, Order, OrderType, OrderStatus, OrderSide, ConfigManager
 from mm_bot.config.config import BotConfig
+from mm_bot.config.config_watcher import ConfigWatcher
 from mm_bot.quoter.quoter import Quoter
 from mm_bot.position.position_tracker import PositionTracker
 from mm_bot.pricing.oracle import OracleService, KuruPriceSource, CoinbasePriceSource
@@ -95,7 +96,7 @@ class Bot:
             self.oracle_service.add_price_source("kuru", self.kuru_price_source)
         else:
             # Coinbase API price source (default)
-            self.coinbase_price_source = CoinbasePriceSource(symbol="MON-USD")
+            self.coinbase_price_source = CoinbasePriceSource(symbol=self.bot_config.coinbase_symbol)
             self.oracle_service.add_price_source("coinbase", self.coinbase_price_source)
             self.kuru_price_source = None  # Not used
 
@@ -104,6 +105,12 @@ class Bot:
 
         # Quoters will be created after position tracker is initialized
         self.quoters: List[Quoter] = []
+
+        # Config watcher for hot-reload
+        self.config_watcher: Optional[ConfigWatcher] = None
+
+        # Reinitialization flag (pause trading during config reload)
+        self.is_reinitializing: bool = False
 
         self.shutdown_event = asyncio.Event()
 
@@ -364,11 +371,20 @@ class Bot:
             position_tracker=self.position_tracker,
             oracle_service=self.oracle_service,
             market_id=self.market_config.market_address,
-            source_name="kuru"
+            source_name=self.oracle_source
         )
 
         # Create quoters with calculated quantity
         self._initialize_quoters()
+
+        # Start config watcher (if bot_config.toml exists)
+        config_path = Path("bot_config.toml")
+        if config_path.exists():
+            self.config_watcher = ConfigWatcher(config_path, self._on_config_reload)
+            await self.config_watcher.start()
+            logger.info("🔄 Hot-reload enabled: checking for config changes every 5s")
+        else:
+            logger.info("Hot-reload disabled: bot_config.toml not found")
 
         # Run main loop
         await self.run_main_loop()
@@ -647,6 +663,11 @@ class Bot:
         Full check (every 10th): Compare all order IDs and clean up phantoms
         """
         try:
+            # Skip validation during reinitialization to avoid conflicts
+            if self.is_reinitializing:
+                self._debug_log("[VALIDATE] Skipping validation during reinitialization")
+                return
+
             self._validation_counter += 1
 
             # Fetch actual active orders from API
@@ -655,7 +676,11 @@ class Bot:
             # QUICK CHECK (every time): Detect orphaned orders
             # This is critical for detecting lost callbacks quickly
             api_order_ids = {int(order.get('orderid')) for order in api_active_orders if order.get('orderid') is not None}
+
+            # Check both active_orders (confirmed) and cloid mappings (order placed)
             tracked_order_ids = {info.order_id for info in self.active_orders.values()}
+            tracked_order_ids.update(self.cloid_to_order_id.values())
+
             missing_in_tracked = api_order_ids - tracked_order_ids
 
             current_time = time.monotonic()
@@ -710,10 +735,19 @@ class Bot:
                     )
                     self._debug_log(f"[VALIDATE] Orphaned orders timed out: {old_orphans} - triggering full reset")
 
-                    # Cancel all active orders
-                    await self._cancel_all_existing_orders()
+                    # Cancel all active orders with retry (ensures all orders are gone)
+                    logger.info("Cancelling all orders due to orphaned orders detected...")
+                    success = await self._cancel_all_orders_with_retry(max_delay=8.0)
+                    if not success:
+                        logger.error("Failed to cancel all orders during orphan recovery, will retry on next iteration")
+                        return
 
-                    # Clear all tracking state
+                    # Wait for any in-flight fill callbacks to arrive before clearing state
+                    # This prevents race condition where fill arrives after state is cleared
+                    logger.info("Waiting 3s for any in-flight fill callbacks...")
+                    await asyncio.sleep(3.0)
+
+                    # Clear all tracking state (safe now that orders are cancelled and callbacks processed)
                     self.active_orders.clear()
                     self.order_sizes.clear()
                     self.preregistered_orders.clear()
@@ -722,7 +756,7 @@ class Bot:
                     self.order_id_to_cloid.clear()
                     self.orphaned_order_timestamps.clear()
 
-                    logger.info("✓ State reset complete. Will resume quoting on next iteration.")
+                    logger.success("✓ State reset complete. All orders cancelled, tracking cleared. Resuming trading.")
                     self._debug_log(f"[VALIDATE] State cleared, ready for fresh start")
                     return
             else:
@@ -828,6 +862,12 @@ class Bot:
         while not self.shutdown_event.is_set():
             try:
                 iteration += 1
+
+                # Skip trading activities during reinitialization
+                if self.is_reinitializing:
+                    logger.debug("Reinitialization in progress, skipping iteration")
+                    await asyncio.sleep(1.0)
+                    continue
 
                 # Periodic reconciliation
                 if self.bot_config.reconcile_interval > 0:
@@ -1214,16 +1254,23 @@ class Bot:
 
         return filtered_orders
 
-    async def stop(self) -> None:
+    async def _cancel_all_orders_with_retry(self, max_delay: float = 8.0) -> bool:
         """
-        Stop the bot: cancel all active orders and stop the client.
-        """
-        logger.info("\n🛑 Stopping bot...")
+        Cancel all active orders with exponential backoff until REST API confirms empty.
 
-        # Cancel all active orders with exponential backoff until REST API confirms empty
+        This handles REST API lag (~2s behind WebSocket) by retrying until
+        the API confirms all orders are cancelled.
+
+        Args:
+            max_delay: Maximum wait time between retries (default 8s)
+
+        Returns:
+            True if all orders cancelled, False if error occurred
+        """
         try:
             delay = 1.0
             attempt = 0
+
             while True:
                 active_orders = self.client.user.get_active_orders()
                 if not active_orders:
@@ -1231,10 +1278,11 @@ class Bot:
                         logger.info("No active orders to cancel")
                     else:
                         logger.success("✓ All orders cancelled successfully")
-                    break
+                    return True
 
                 attempt += 1
                 logger.info(f"Cancelling {len(active_orders)} active orders (attempt {attempt})...")
+
                 try:
                     cancel_tx = await self.client.cancel_all_active_orders_for_market()
                     logger.success(f"✓ Sent cancel transaction: {cancel_tx}")
@@ -1243,11 +1291,148 @@ class Bot:
 
                 logger.info(f"Waiting {delay:.0f}s for cancellation to confirm...")
                 await asyncio.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, max_delay)  # Exponential backoff with cap
+
         except Exception as e:
             logger.error(f"Error during order cancellation: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            return False
+
+    def _on_config_reload(self, new_config: BotConfig):
+        """
+        Callback when config is reloaded.
+
+        Two-tier reload:
+        - Tier 1 (immediate): prop_maintain, reconcile_interval
+        - Tier 2 (full reinit): quoter parameters
+        - Restart required: oracle parameters, override_start_position
+        """
+        # Check what changed
+        tier1_changed = (
+            new_config.prop_maintain != self.bot_config.prop_maintain or
+            new_config.reconcile_interval != self.bot_config.reconcile_interval
+        )
+
+        tier2_changed = (
+            new_config.max_position != self.bot_config.max_position or
+            new_config.prop_skew_entry != self.bot_config.prop_skew_entry or
+            new_config.prop_skew_exit != self.bot_config.prop_skew_exit or
+            new_config.quantity != self.bot_config.quantity or
+            new_config.quantity_bps_per_level != self.bot_config.quantity_bps_per_level or
+            new_config.quoters_bps != self.bot_config.quoters_bps
+        )
+
+        restart_required = (
+            new_config.oracle_source != self.bot_config.oracle_source or
+            new_config.coinbase_symbol != self.bot_config.coinbase_symbol or
+            new_config.override_start_position != self.bot_config.override_start_position or
+            new_config.market_address != self.bot_config.market_address
+        )
+
+        # Apply tier 1 changes (immediate)
+        if tier1_changed:
+            old_prop = self.bot_config.prop_maintain
+            old_reconcile = self.bot_config.reconcile_interval
+
+            self.bot_config.prop_maintain = new_config.prop_maintain
+            self.bot_config.reconcile_interval = new_config.reconcile_interval
+
+            if old_prop != new_config.prop_maintain:
+                logger.success(f"✓ Config reloaded: prop_maintain={new_config.prop_maintain} (was {old_prop})")
+            if old_reconcile != new_config.reconcile_interval:
+                logger.success(f"✓ Config reloaded: reconcile_interval={new_config.reconcile_interval} (was {old_reconcile})")
+
+        # Apply tier 2 changes (full reinit)
+        if tier2_changed:
+            logger.info("🔄 Quoter config changed, reinitializing...")
+            asyncio.create_task(self._reinitialize_quoters_from_config(new_config))
+
+        # Warn about restart-required changes
+        if restart_required:
+            if new_config.oracle_source != self.bot_config.oracle_source:
+                logger.warning("⚠️  oracle_source changed. Restart required to apply.")
+            if new_config.coinbase_symbol != self.bot_config.coinbase_symbol:
+                logger.warning("⚠️  coinbase_symbol changed. Restart required to apply.")
+            if new_config.override_start_position != self.bot_config.override_start_position:
+                logger.warning("⚠️  override_start_position changed. Restart required to apply.")
+            if new_config.market_address != self.bot_config.market_address:
+                logger.warning("⚠️  market_address changed. Restart required to apply.")
+
+        # If nothing changed, log it
+        if not (tier1_changed or tier2_changed or restart_required):
+            logger.info("Config file modified but no effective changes detected")
+
+    async def _reinitialize_quoters_from_config(self, new_config: BotConfig):
+        """
+        Reinitialize quoters with new config.
+
+        Procedure:
+        1. Pause trading (set reinitialization flag)
+        2. Save position state
+        3. Cancel all active orders (with retry)
+        4. Update config
+        5. Reinitialize quoters
+        6. Reconcile position (verify state after reinit)
+        7. Resume trading
+        """
+        try:
+            # 1. Pause trading - main loop will skip order placement and reconciliation
+            self.is_reinitializing = True
+            logger.info("⏸️  Pausing trading for reinitialization...")
+
+            # 2. Save position state
+            if self.position_tracker:
+                self.position_tracker.save_state()
+                logger.info("💾 Position state saved before reinitialization")
+
+            # 3. Cancel all active orders with retry
+            logger.info("Cancelling all active orders before reinitialization...")
+            success = await self._cancel_all_orders_with_retry(max_delay=4.0)
+            if not success:
+                logger.error("Failed to cancel all orders, aborting reinitialization")
+                self.is_reinitializing = False  # Resume trading even on failure
+                return
+
+            # 4. Update bot config
+            self.bot_config = new_config
+
+            # 5. Reinitialize quoters
+            self.quoters.clear()
+            self._initialize_quoters()
+            logger.success(f"✓ Quoters reinitialized with {len(self.quoters)} levels")
+
+            # 6. Log new configuration
+            logger.info(f"New quoter config:")
+            logger.info(f"  max_position: {new_config.max_position}")
+            logger.info(f"  prop_skew_entry: {new_config.prop_skew_entry}")
+            logger.info(f"  prop_skew_exit: {new_config.prop_skew_exit}")
+            logger.info(f"  quantity: {new_config.quantity}")
+            logger.info(f"  quantity_bps_per_level: {new_config.quantity_bps_per_level}")
+            logger.info(f"  quoters_bps: {new_config.quoters_bps}")
+
+            # 7. Reconcile position after reinitialization to verify state
+            logger.info("🔍 Reconciling position after reinitialization...")
+            await self._reconcile_position()
+
+            # 8. Resume trading
+            self.is_reinitializing = False
+            logger.success("▶️  Trading resumed")
+
+        except Exception as e:
+            logger.error(f"Failed to reinitialize quoters: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.is_reinitializing = False  # Always resume trading on error
+
+    async def stop(self) -> None:
+        """
+        Stop the bot: cancel all active orders and stop the client.
+        """
+        logger.info("\n🛑 Stopping bot...")
+
+        # Cancel all active orders with exponential backoff
+        await self._cancel_all_orders_with_retry()
 
         # Save position state before shutdown
         if hasattr(self, 'position_tracker') and self.position_tracker:
@@ -1257,6 +1442,11 @@ class Bot:
                 logger.info(f"💾 Position state saved: {total_pos:.2f}")
             except Exception as e:
                 logger.error(f"Failed to save position state on shutdown: {e}")
+
+        # Stop config watcher
+        if self.config_watcher:
+            await self.config_watcher.stop()
+            logger.success("✓ Config watcher stopped")
 
         # Stop Kuru WebSocket
         if hasattr(self, 'kuru_price_source') and self.kuru_price_source:

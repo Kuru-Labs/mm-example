@@ -18,6 +18,8 @@ class PnlTracker:
             PnL
         """
         price = self.oracle_service.get_price(self.market_id, self.source_name)
+        if price is None:
+            return None
 
         position = self.position_tracker.get_current_position()
         return self.position_tracker.get_quote_position() + position * price
@@ -31,5 +33,8 @@ class PnlTracker:
         Print the PnL
         """
         pnl = self.get_pnl()
+        if pnl is None:
+            logger.debug("PnL unavailable (no price from oracle)")
+            return
         logger.info(f"PnL: {pnl:.4f}")
         logger.info("=" * 80)
