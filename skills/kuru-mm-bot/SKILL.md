@@ -34,14 +34,11 @@ The root-level `kuru_imports.py` is unused dead code. Do not import from it.
 **1. Three tracking dicts are always set and cleared together:**
 `active_cloids`, `active_orders`, `order_sizes` — all populated at ORDER_PLACED, all cleared at CANCELLED/FULLY_FILLED. Breaking this invariant corrupts prop-maintain and reconciliation.
 
-**2. Always pass `transaction_config` to `KuruClient.create()`:**
+**2. Always initialize `KuruClient` from full SDK config bundle:**
 ```python
-self.client = await KuruClient.create(
-    ...
-    transaction_config=ConfigManager.load_transaction_config(),
-)
+self.client = await KuruClient.create(**sdk_configs)
 ```
-Omitting it silently ignores `KURU_GAS_BUFFER_MULTIPLIER` from `.env` and uses the SDK hardcoded default (1.1×), causing gas under-estimation where cancels succeed but placements silently fail mid-batch.
+Do not bypass bundle-based initialization with partial ad-hoc config wiring. Keep all transaction/websocket/order-execution/cache settings flowing from `ConfigManager.load_all_configs(...)`.
 
 **3. Cloid format is load-bearing:**
 ```

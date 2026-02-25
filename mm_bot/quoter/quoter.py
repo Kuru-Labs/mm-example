@@ -1,4 +1,5 @@
 from typing import Optional
+from decimal import Decimal
 import time
 from loguru import logger
 
@@ -25,24 +26,29 @@ class Quoter:
         self.position_tracker = position_tracker
         self.source_name = source_name
         self.market_id = market_id
-        self.baseline_edge_bps = baseline_edge_bps
-        self.max_position = max_position
-        self.prop_skew_entry = prop_skew_entry
-        self.prop_skew_exit = prop_skew_exit
-        self.quantity = quantity
         self.market_config = market_config
+        self.baseline_edge_bps = Decimal(str(baseline_edge_bps))
+        self.max_position = Decimal(str(max_position))
+        self.prop_skew_entry = Decimal(str(prop_skew_entry))
+        self.prop_skew_exit = Decimal(str(prop_skew_exit))
+        self.quantity = Decimal(str(quantity))
 
-    def _cap_value(self, value: float, min_val: float, max_val: float) -> float:
+    def _to_decimal(self, value) -> Decimal:
+        if isinstance(value, Decimal):
+            return value
+        return Decimal(str(value))
+
+    def _cap_value(self, value: Decimal, min_val: Decimal, max_val: Decimal) -> Decimal:
         """Cap a value between min_val and max_val"""
         return max(min_val, min(max_val, value))
 
-    def _calculate_prop_of_max_position(self) -> float:
+    def _calculate_prop_of_max_position(self) -> Decimal:
         """Calculate the proportional position relative to max position, capped at [-1, 1]"""
         current_position = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
-        prop_of_max = current_position / self.max_position if self.max_position != 0 else 0
-        return self._cap_value(prop_of_max, -1, 1)
+        prop_of_max = current_position / self.max_position if self.max_position != 0 else Decimal("0")
+        return self._cap_value(prop_of_max, Decimal("-1"), Decimal("1"))
 
-    def get_bid_ask_edges(self) -> tuple[Optional[float], Optional[float]]:
+    def get_bid_ask_edges(self) -> tuple[Optional[Decimal], Optional[Decimal]]:
         """
         Calculate bid and ask edges in bps based on the strategy type and position
 
@@ -53,16 +59,16 @@ class Quoter:
 
         if prop_of_max > 0:
             # Currently long: widen asks, tighten bids to mean-revert
-            bid_edge_bps = self.baseline_edge_bps * (1 + prop_of_max * self.prop_skew_entry)
-            ask_edge_bps = self.baseline_edge_bps * (1 - prop_of_max * self.prop_skew_exit)
+            bid_edge_bps = self.baseline_edge_bps * (Decimal("1") + prop_of_max * self.prop_skew_entry)
+            ask_edge_bps = self.baseline_edge_bps * (Decimal("1") - prop_of_max * self.prop_skew_exit)
         else:
             # Currently short: widen bids, tighten asks to mean-revert
-            bid_edge_bps = self.baseline_edge_bps * (1 - prop_of_max * self.prop_skew_exit)
-            ask_edge_bps = self.baseline_edge_bps * (1 + prop_of_max * self.prop_skew_entry)
+            bid_edge_bps = self.baseline_edge_bps * (Decimal("1") - prop_of_max * self.prop_skew_exit)
+            ask_edge_bps = self.baseline_edge_bps * (Decimal("1") + prop_of_max * self.prop_skew_entry)
 
         return bid_edge_bps, ask_edge_bps
 
-    def get_cancel_edges(self, prop_maintain: float) -> tuple[float, float]:
+    def get_cancel_edges(self, prop_maintain: float) -> tuple[Decimal, Decimal]:
         """
         Get the cancel edge thresholds (edges below which orders should be cancelled).
 
@@ -75,12 +81,13 @@ class Quoter:
         bid_edge_bps, ask_edge_bps = self.get_bid_ask_edges()
 
         # Cancel edges are reduced by prop_maintain factor
-        bid_cancel_edge_bps = bid_edge_bps * (1 - prop_maintain)
-        ask_cancel_edge_bps = ask_edge_bps * (1 - prop_maintain)
+        maintain = self._to_decimal(prop_maintain)
+        bid_cancel_edge_bps = bid_edge_bps * (Decimal("1") - maintain)
+        ask_cancel_edge_bps = ask_edge_bps * (Decimal("1") - maintain)
 
         return bid_cancel_edge_bps, ask_cancel_edge_bps
 
-    def calculate_order_edge(self, order_price: float, order_side: OrderSide, reference_price: float) -> float:
+    def calculate_order_edge(self, order_price: Decimal, order_side: OrderSide, reference_price: Decimal) -> Decimal:
         """
         Calculate the edge (in bps) of an existing order.
 
@@ -94,18 +101,21 @@ class Quoter:
         """
         if order_side == OrderSide.BUY:
             # Bid edge: how much below fair value
-            edge = (reference_price - order_price) / reference_price * 10000
+            edge = (reference_price - order_price) / reference_price * Decimal("10000")
         else:  # SELL
             # Ask edge: how much above fair value
-            edge = (order_price - reference_price) / reference_price * 10000
+            edge = (order_price - reference_price) / reference_price * Decimal("10000")
 
         return edge
 
-    def get_reference_price(self) -> Optional[float]:
+    def get_reference_price(self) -> Optional[Decimal]:
         """Get the reference price from the oracle service"""
-        return self.oracle_service.get_price(self.market_id, self.source_name)
+        reference_price = self.oracle_service.get_price(self.market_id, self.source_name)
+        if reference_price is None:
+            return None
+        return self._to_decimal(reference_price)
 
-    def generate_orders(self, reference_price: float, need_bid: bool = True, need_ask: bool = True) -> list[Order]:
+    def generate_orders(self, reference_price: Decimal, need_bid: bool = True, need_ask: bool = True) -> list[Order]:
         """
         Generate orders for specified sides based on current market conditions.
 
@@ -127,7 +137,7 @@ class Quoter:
 
         if need_bid:
             # Calculate bid price
-            bid_multiplier = 1 - (bid_edge_bps / 10000)
+            bid_multiplier = Decimal("1") - (bid_edge_bps / Decimal("10000"))
             # Tick rounding is delegated to SDK place_orders(price_rounding="default")
             bid_price = reference_price * bid_multiplier
             bid_cloid = f"bid-{self.baseline_edge_bps}-{timestamp}"
@@ -140,11 +150,14 @@ class Quoter:
                 size=self.quantity,
                 post_only=False
             ))
-            logger.debug(f"New bid: cloid={bid_cloid} price={bid_price:.6f} size={self.quantity} edge={bid_edge_bps:.2f}bps")
+            logger.debug(
+                f"New bid: cloid={bid_cloid} price={float(bid_price):.6f} "
+                f"size={float(self.quantity)} edge={float(bid_edge_bps):.2f}bps"
+            )
 
         if need_ask:
             # Calculate ask price
-            ask_multiplier = 1 + (ask_edge_bps / 10000)
+            ask_multiplier = Decimal("1") + (ask_edge_bps / Decimal("10000"))
             # Tick rounding is delegated to SDK place_orders(price_rounding="default")
             ask_price = reference_price * ask_multiplier
             ask_cloid = f"ask-{self.baseline_edge_bps}-{timestamp}"
@@ -157,7 +170,10 @@ class Quoter:
                 size=self.quantity,
                 post_only=False
             ))
-            logger.debug(f"New ask: cloid={ask_cloid} price={ask_price:.6f} size={self.quantity} edge={ask_edge_bps:.2f}bps")
+            logger.debug(
+                f"New ask: cloid={ask_cloid} price={float(ask_price):.6f} "
+                f"size={float(self.quantity)} edge={float(ask_edge_bps):.2f}bps"
+            )
 
         return orders
 

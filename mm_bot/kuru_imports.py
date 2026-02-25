@@ -18,3 +18,15 @@ from kuru_sdk_py.configs import (
     CacheConfig,
     market_config_from_market_address,
 )
+from kuru_sdk_py.exceptions import (
+    KuruError,
+    KuruConfigError,
+    KuruConnectionError,
+    KuruWebSocketError,
+    KuruTransactionError,
+    KuruContractError,
+    KuruInsufficientFundsError,
+    KuruAuthorizationError,
+    KuruOrderError,
+    KuruTimeoutError,
+)

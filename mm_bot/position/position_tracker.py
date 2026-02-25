@@ -1,8 +1,16 @@
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
+from decimal import Decimal
 import json
 from loguru import logger
+
+
+def _to_decimal(value) -> Decimal:
+    """Convert numeric values to Decimal without binary float artifacts."""
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 
 class PositionTracker:
@@ -13,16 +21,16 @@ class PositionTracker:
     Buy orders increase position, sell orders decrease position.
     """
 
-    def __init__(self, start_position: float = 0.0):
+    def __init__(self, start_position: float | Decimal = 0.0):
         """
         Initialize position tracker.
 
         Args:
             start_position: Initial position in base currency
         """
-        self.start_position = start_position
-        self.current_position = 0.0  # Change from start position
-        self.quote_position = 0.0  # Net quote spent/received
+        self.start_position = _to_decimal(start_position)
+        self.current_position = Decimal("0")  # Change from start position
+        self.quote_position = Decimal("0")  # Net quote spent/received
 
         # Setup debug log file
         debug_log_dir = Path("tracking")
@@ -33,7 +41,7 @@ class PositionTracker:
         # Create/clear debug log file
         with open(self.debug_log_path, 'w') as f:
             f.write(f"=== Position Tracker Debug Log - Started {datetime.now().isoformat()} ===\n")
-            f.write(f"Initial start_position: {start_position:.6f}\n\n")
+            f.write(f"Initial start_position: {float(self.start_position):.6f}\n\n")
 
     def _debug_log(self, message: str) -> None:
         """Write to both logger and debug file."""
@@ -42,7 +50,7 @@ class PositionTracker:
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             f.write(f"[{timestamp}] {message}\n")
 
-    def update_position(self, side, filled_size: float, price: float) -> None:
+    def update_position(self, side, filled_size: float | Decimal, price: float | Decimal) -> None:
         """
         Update position based on a trade fill.
 
@@ -59,34 +67,51 @@ class PositionTracker:
             sys.path.insert(0, str(our_src))
         from mm_bot.kuru_imports import OrderSide
 
+        filled_size_dec = _to_decimal(filled_size)
+        price_dec = _to_decimal(price)
+
         self._debug_log(
-            f"[POSITION] BEFORE fill - current_position: {self.current_position:.2f}, "
-            f"start_position: {self.start_position:.2f}, "
-            f"total: {self.current_position + self.start_position:.2f}"
+            f"[POSITION] BEFORE fill - current_position: {float(self.current_position):.2f}, "
+            f"start_position: {float(self.start_position):.2f}, "
+            f"total: {float(self.current_position + self.start_position):.2f}"
         )
         self._debug_log(
             f"[POSITION] Fill details - side: {side.value if hasattr(side, 'value') else side}, "
-            f"filled_size: {filled_size:.2f}, price: {price:.6f}"
+            f"filled_size: {float(filled_size_dec):.2f}, price: {float(price_dec):.6f}"
         )
 
         if side == OrderSide.BUY:
-            self.current_position += filled_size
-            self.quote_position -= price * filled_size
-            self._debug_log(f"[POSITION] AFTER BUY - current_position: {self.current_position:.2f} (+{filled_size:.2f})")
-            logger.info(f"Position update (BUY): +{filled_size} base @ {price} | Total: {self.get_current_position()}")
+            self.current_position += filled_size_dec
+            self.quote_position -= price_dec * filled_size_dec
+            self._debug_log(
+                f"[POSITION] AFTER BUY - current_position: {float(self.current_position):.2f} "
+                f"(+{float(filled_size_dec):.2f})"
+            )
+            logger.info(
+                f"Position update (BUY): +{float(filled_size_dec)} base @ {float(price_dec)} | "
+                f"Total: {float(self.get_current_position())}"
+            )
         elif side == OrderSide.SELL:
-            self.current_position -= filled_size
-            self.quote_position += price * filled_size
-            self._debug_log(f"[POSITION] AFTER SELL - current_position: {self.current_position:.2f} (-{filled_size:.2f})")
-            logger.info(f"Position update (SELL): -{filled_size} base @ {price} | Total: {self.get_current_position()}")
+            self.current_position -= filled_size_dec
+            self.quote_position += price_dec * filled_size_dec
+            self._debug_log(
+                f"[POSITION] AFTER SELL - current_position: {float(self.current_position):.2f} "
+                f"(-{float(filled_size_dec):.2f})"
+            )
+            logger.info(
+                f"Position update (SELL): -{float(filled_size_dec)} base @ {float(price_dec)} | "
+                f"Total: {float(self.get_current_position())}"
+            )
 
-        self._debug_log(f"[POSITION] New total position: {self.current_position + self.start_position:.2f}\n")
+        self._debug_log(
+            f"[POSITION] New total position: {float(self.current_position + self.start_position):.2f}\n"
+        )
 
         # Auto-save state after each position update
         self.save_state()
 
 
-    def get_current_position(self) -> float:
+    def get_current_position(self) -> Decimal:
         """
         Get total current position (start + changes).
 
@@ -95,7 +120,7 @@ class PositionTracker:
         """
         return self.current_position
 
-    def get_quote_position(self) -> float:
+    def get_quote_position(self) -> Decimal:
         """
         Get net quote position (positive = received, negative = spent).
 
@@ -104,7 +129,7 @@ class PositionTracker:
         """
         return self.quote_position
 
-    def get_start_position(self) -> float:
+    def get_start_position(self) -> Decimal:
         """
         Get the initial starting position.
 
@@ -119,17 +144,17 @@ class PositionTracker:
         """
         try:
             state = {
-                'start_position': self.start_position,
-                'current_position': self.current_position,
-                'quote_position': self.quote_position,
-                'total_position': self.current_position + self.start_position,
+                'start_position': str(self.start_position),
+                'current_position': str(self.current_position),
+                'quote_position': str(self.quote_position),
+                'total_position': str(self.current_position + self.start_position),
                 'last_updated': datetime.now().isoformat()
             }
 
             with open(self.state_file_path, 'w') as f:
                 json.dump(state, f, indent=2)
 
-            logger.debug(f"Position state saved: position={state['total_position']:.2f}")
+            logger.debug(f"Position state saved: position={float(self.current_position + self.start_position):.2f}")
         except Exception as e:
             logger.error(f"Failed to save position state: {e}")
 
@@ -152,8 +177,11 @@ class PositionTracker:
             with open(state_file_path, 'r') as f:
                 state = json.load(f)
 
-            logger.info(f"Loaded position state: position={state.get('total_position', 0):.2f}, "
-                       f"last_updated={state.get('last_updated', 'unknown')}")
+            total_position = _to_decimal(state.get('total_position', "0"))
+            logger.info(
+                f"Loaded position state: position={float(total_position):.2f}, "
+                f"last_updated={state.get('last_updated', 'unknown')}"
+            )
             return state
         except Exception as e:
             logger.error(f"Failed to load position state: {e}")

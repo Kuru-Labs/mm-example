@@ -105,14 +105,16 @@ async def main():
     if config_path.exists():
         bot_config = load_operational_config(config_path)
         logger.info(f"🔧 Loaded operational config from: {config_path}")
-        # Load secrets from .env (use market_address from config if provided)
-        wallet_config, connection_config, market_config = load_secrets_from_env(
+        # Load SDK configs from .env (use market_address from config if provided)
+        sdk_configs = load_secrets_from_env(
             market_address=bot_config.market_address
         )
     else:
         logger.warning("bot_config.toml not found, falling back to .env (hot-reload disabled)")
         # Use legacy .env loader for everything
-        wallet_config, connection_config, market_config, bot_config = load_config_from_env()
+        sdk_configs, bot_config = load_config_from_env()
+
+    market_config = sdk_configs["market_config"]
 
     logger.info(f"Market: {market_config.market_symbol}")
     logger.info(f"Max Position: {bot_config.max_position}")
@@ -120,7 +122,7 @@ async def main():
     logger.info(f"Quoters (bps): {bot_config.quoters_bps}")
 
     # Create bot
-    bot = Bot(connection_config, wallet_config, market_config, bot_config)
+    bot = Bot(sdk_configs, bot_config)
 
     # Setup signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()

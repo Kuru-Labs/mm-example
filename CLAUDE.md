@@ -24,11 +24,11 @@ This is an async market making bot for Kuru DEX on Monad. It maintains bid/ask q
 
 ### Entry point and config
 
-`mm_bot/main.py` → `load_config_from_env()` → constructs `Bot` → `await bot.start()`.
+`mm_bot/main.py` → load SDK config bundle via `ConfigManager.load_all_configs(...)` in `mm_bot/config/config.py` → construct `Bot` → `await bot.start()`.
 
-All configuration comes from `.env` via `mm_bot/config/config.py`. `BotConfig` is a dataclass holding strategy params. SDK-level configs (wallet, connection, market, transaction) are loaded by `ConfigManager` from the SDK.
+Operational strategy configuration comes from `bot_config.toml` (with `.env` fallback). `BotConfig` is a dataclass holding strategy params. SDK-level configs are loaded as a full bundle via `ConfigManager.load_all_configs(...)`.
 
-**Critical:** `KuruClient.create()` must receive `transaction_config=ConfigManager.load_transaction_config()` explicitly. Omitting it silently uses hardcoded SDK defaults and ignores `KURU_GAS_BUFFER_MULTIPLIER` from `.env`.
+**Critical:** Keep SDK client initialization on the full config bundle path (`KuruClient.create(**sdk_configs)`) so transaction/websocket/order-execution/cache settings all flow from environment defaults and overrides.
 
 ### Two kuru_imports files
 
