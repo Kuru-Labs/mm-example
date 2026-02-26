@@ -149,6 +149,9 @@ def load_config_from_env():
     """
     load_dotenv()
 
+    # Load cache config
+    cache_config = ConfigManager.load_cache_config()
+
     # Load secrets
     wallet_config, connection_config, market_config = load_secrets_from_env()
 
