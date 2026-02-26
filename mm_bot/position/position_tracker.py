@@ -21,15 +21,14 @@ class PositionTracker:
     Buy orders increase position, sell orders decrease position.
     """
 
-    def __init__(self, start_position: float | Decimal = 0.0):
+    def __init__(self, starting_position: float | Decimal = 0.0):
         """
         Initialize position tracker.
 
         Args:
-            start_position: Initial position in base currency
+            starting_position: Initial position in base currency
         """
-        self.start_position = _to_decimal(start_position)
-        self.current_position = Decimal("0")  # Change from start position
+        self.current_position = _to_decimal(starting_position)  # Total position in base currency
         self.quote_position = Decimal("0")  # Net quote spent/received
 
         # Setup debug log file
@@ -41,7 +40,7 @@ class PositionTracker:
         # Create/clear debug log file
         with open(self.debug_log_path, 'w') as f:
             f.write(f"=== Position Tracker Debug Log - Started {datetime.now().isoformat()} ===\n")
-            f.write(f"Initial start_position: {float(self.start_position):.6f}\n\n")
+            f.write(f"Initial position: {float(self.current_position):.6f}\n\n")
 
     def _debug_log(self, message: str) -> None:
         """Write to both logger and debug file."""
@@ -71,9 +70,7 @@ class PositionTracker:
         price_dec = _to_decimal(price)
 
         self._debug_log(
-            f"[POSITION] BEFORE fill - current_position: {float(self.current_position):.2f}, "
-            f"start_position: {float(self.start_position):.2f}, "
-            f"total: {float(self.current_position + self.start_position):.2f}"
+            f"[POSITION] BEFORE fill - position: {float(self.current_position):.2f}"
         )
         self._debug_log(
             f"[POSITION] Fill details - side: {side.value if hasattr(side, 'value') else side}, "
@@ -84,7 +81,7 @@ class PositionTracker:
             self.current_position += filled_size_dec
             self.quote_position -= price_dec * filled_size_dec
             self._debug_log(
-                f"[POSITION] AFTER BUY - current_position: {float(self.current_position):.2f} "
+                f"[POSITION] AFTER BUY - position: {float(self.current_position):.2f} "
                 f"(+{float(filled_size_dec):.2f})"
             )
             logger.info(
@@ -95,7 +92,7 @@ class PositionTracker:
             self.current_position -= filled_size_dec
             self.quote_position += price_dec * filled_size_dec
             self._debug_log(
-                f"[POSITION] AFTER SELL - current_position: {float(self.current_position):.2f} "
+                f"[POSITION] AFTER SELL - position: {float(self.current_position):.2f} "
                 f"(-{float(filled_size_dec):.2f})"
             )
             logger.info(
@@ -104,7 +101,7 @@ class PositionTracker:
             )
 
         self._debug_log(
-            f"[POSITION] New total position: {float(self.current_position + self.start_position):.2f}\n"
+            f"[POSITION] New position: {float(self.current_position):.2f}\n"
         )
 
         # Auto-save state after each position update
@@ -113,7 +110,7 @@ class PositionTracker:
 
     def get_current_position(self) -> Decimal:
         """
-        Get total current position (start + changes).
+        Get total current position in base currency.
 
         Returns:
             Total position in base currency
@@ -129,32 +126,21 @@ class PositionTracker:
         """
         return self.quote_position
 
-    def get_start_position(self) -> Decimal:
-        """
-        Get the initial starting position.
-
-        Returns:
-            Starting position
-        """
-        return self.start_position
-
     def save_state(self) -> None:
         """
         Save position state to JSON file for persistence across restarts.
         """
         try:
             state = {
-                'start_position': str(self.start_position),
                 'current_position': str(self.current_position),
                 'quote_position': str(self.quote_position),
-                'total_position': str(self.current_position + self.start_position),
                 'last_updated': datetime.now().isoformat()
             }
 
             with open(self.state_file_path, 'w') as f:
                 json.dump(state, f, indent=2)
 
-            logger.debug(f"Position state saved: position={float(self.current_position + self.start_position):.2f}")
+            logger.debug(f"Position state saved: position={float(self.current_position):.2f}")
         except Exception as e:
             logger.error(f"Failed to save position state: {e}")
 
@@ -162,6 +148,9 @@ class PositionTracker:
     def load_state(cls, state_file_path: Path) -> Optional[dict]:
         """
         Load position state from JSON file.
+
+        Supports both old format (with start_position/current_position split)
+        and new format (single current_position).
 
         Args:
             state_file_path: Path to the state file
@@ -177,12 +166,32 @@ class PositionTracker:
             with open(state_file_path, 'r') as f:
                 state = json.load(f)
 
-            total_position = _to_decimal(state.get('total_position', "0"))
+            # Migration: Handle old format with start_position + current_position
+            if 'total_position' in state:
+                # Old format - use total_position
+                position = _to_decimal(state.get('total_position', "0"))
+                logger.info(f"Migrating old position state format (using total_position)")
+            elif 'start_position' in state:
+                # Old format - calculate total
+                start = _to_decimal(state.get('start_position', "0"))
+                current = _to_decimal(state.get('current_position', "0"))
+                position = start + current
+                logger.info(f"Migrating old position state format (start + current)")
+            else:
+                # New format
+                position = _to_decimal(state.get('current_position', "0"))
+
             logger.info(
-                f"Loaded position state: position={float(total_position):.2f}, "
+                f"Loaded position state: position={float(position):.2f}, "
                 f"last_updated={state.get('last_updated', 'unknown')}"
             )
-            return state
+
+            # Return normalized format
+            return {
+                'current_position': str(position),
+                'quote_position': state.get('quote_position', "0"),
+                'last_updated': state.get('last_updated')
+            }
         except Exception as e:
             logger.error(f"Failed to load position state: {e}")
             logger.warning("Starting with fresh position state")

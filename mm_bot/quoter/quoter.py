@@ -44,7 +44,7 @@ class Quoter:
 
     def _calculate_prop_of_max_position(self) -> Decimal:
         """Calculate the proportional position relative to max position, capped at [-1, 1]"""
-        current_position = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
+        current_position = self.position_tracker.get_current_position()
         prop_of_max = current_position / self.max_position if self.max_position != 0 else Decimal("0")
         return self._cap_value(prop_of_max, Decimal("-1"), Decimal("1"))
 

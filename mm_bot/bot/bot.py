@@ -470,62 +470,50 @@ class Bot:
 
             if self.bot_config.override_start_position is not None:
                 # Config override takes precedence
-                start_position = _to_decimal(self.bot_config.override_start_position)
-                current_position = Decimal("0")
+                starting_position = _to_decimal(self.bot_config.override_start_position)
                 quote_position = Decimal("0")
-                self._debug_log(f"[INIT] Using CONFIG OVERRIDE start position: {float(start_position):.6f}")
+                self._debug_log(f"[INIT] Using CONFIG OVERRIDE starting position: {float(starting_position):.6f}")
                 logger.info(
-                    f"Using override starting position: {float(start_position):.6f} "
+                    f"Using override starting position: {float(starting_position):.6f} "
                     f"(ignoring saved state)"
                 )
             elif saved_state:
-                # Restore from saved state
-                start_position = _to_decimal(saved_state.get('start_position', "0"))
-                current_position = _to_decimal(saved_state.get('current_position', "0"))
+                # Restore from saved state (normalized by load_state)
+                starting_position = _to_decimal(saved_state.get('current_position', "0"))
                 quote_position = _to_decimal(saved_state.get('quote_position', "0"))
-                total_position = saved_state.get('total_position', start_position + current_position)
                 self._debug_log(f"[INIT] Restoring from saved state:")
-                self._debug_log(f"[INIT]   start_position: {float(start_position):.6f}")
-                self._debug_log(f"[INIT]   current_position: {float(current_position):.6f}")
-                self._debug_log(f"[INIT]   total_position: {float(_to_decimal(total_position)):.6f}")
+                self._debug_log(f"[INIT]   position: {float(starting_position):.6f}")
                 logger.info(
-                    f"Restored position from saved state: {float(_to_decimal(total_position)):.2f} "
+                    f"Restored position from saved state: {float(starting_position):.2f} "
                     f"(last updated: {saved_state.get('last_updated', 'unknown')})"
                 )
             else:
                 # Default to 0 for neutral market-making strategy
-                start_position = Decimal("0")
-                current_position = Decimal("0")
+                starting_position = Decimal("0")
                 quote_position = Decimal("0")
-                self._debug_log(f"[INIT] No saved state - defaulting to start position: 0.0 (neutral strategy)")
+                self._debug_log(f"[INIT] No saved state - defaulting to position: 0.0 (neutral strategy)")
                 logger.info("Starting position set to 0 (neutral strategy - tracks net buys/sells)")
 
             # Initialize position tracker
-            self.position_tracker = PositionTracker(start_position=start_position)
+            self.position_tracker = PositionTracker(starting_position=starting_position)
 
-            # Restore state if loaded
+            # Restore quote position if loaded
             if saved_state and self.bot_config.override_start_position is None:
-                self.position_tracker.current_position = current_position
                 self.position_tracker.quote_position = quote_position
 
             self._debug_log(f"[INIT] ✓ Position tracker initialized")
-            self._debug_log(f"[INIT]   start_position: {float(self.position_tracker.get_start_position()):.6f}")
-            self._debug_log(f"[INIT]   current_position: {float(self.position_tracker.get_current_position()):.6f}")
-            self._debug_log(
-                f"[INIT]   total_position: "
-                f"{float(self.position_tracker.get_current_position() + self.position_tracker.get_start_position()):.6f}\n"
-            )
+            self._debug_log(f"[INIT]   position: {float(self.position_tracker.get_current_position()):.6f}\n")
             logger.success(
                 f"✓ Position tracker initialized: "
-                f"total={float(self.position_tracker.get_current_position() + self.position_tracker.get_start_position()):.2f}"
+                f"position={float(self.position_tracker.get_current_position()):.2f}"
             )
 
         except Exception as e:
             logger.error(f"Failed to initialize position tracker: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            logger.warning("Falling back to start_position=0.0")
-            self.position_tracker = PositionTracker(start_position=Decimal("0"))
+            logger.warning("Falling back to starting_position=0.0")
+            self.position_tracker = PositionTracker(starting_position=Decimal("0"))
 
     def _initialize_quoters(self) -> None:
         """
@@ -642,14 +630,10 @@ class Bot:
             )
 
             # Calculate tracked position
-            current_pos = self.position_tracker.get_current_position()
-            start_pos = self.position_tracker.get_start_position()
-            tracked_position = current_pos + start_pos
+            tracked_position = self.position_tracker.get_current_position()
 
             self._debug_log(f"[RECONCILE] Position tracker:")
-            self._debug_log(f"[RECONCILE]   start_position: {float(start_pos):.6f}")
-            self._debug_log(f"[RECONCILE]   current_position: {float(current_pos):.6f}")
-            self._debug_log(f"[RECONCILE]   total tracked: {float(tracked_position):.6f}")
+            self._debug_log(f"[RECONCILE]   tracked position: {float(tracked_position):.6f}")
 
             # Drift detection - compare total owned vs tracked
             drift = total_base - tracked_position
@@ -1135,7 +1119,7 @@ class Bot:
         total_new_orders = 0
 
         # Check position limits for one-sided quoting
-        current_position = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
+        current_position = self.position_tracker.get_current_position()
         stop_bids = current_position > self.bot_config.max_position
         stop_asks = current_position < -self.bot_config.max_position
 
@@ -1708,7 +1692,7 @@ class Bot:
         if hasattr(self, 'position_tracker') and self.position_tracker:
             try:
                 self.position_tracker.save_state()
-                total_pos = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
+                total_pos = self.position_tracker.get_current_position()
                 logger.info(f"💾 Position state saved: {float(total_pos):.2f}")
             except Exception as e:
                 logger.error(f"Failed to save position state on shutdown: {e}")
