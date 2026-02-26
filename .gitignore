@@ -1,5 +1,9 @@
 # Environment variables - NEVER commit this!
 .env
+.wallet
+
+# Tracking
+tracking/
 
 # Python
 __pycache__/

@@ -52,13 +52,16 @@ def load_secrets_from_env(market_address: Optional[str] = None):
     if market_address is None:
         market_address = os.getenv("MARKET_ADDRESS", "0x065c9d28e428a0db40191a54d33d5b7c71a9c394")
 
+    # Load cache config
+    cache_config = ConfigManager.load_cache_config()
+
     # Load market config from chain
     market_config = ConfigManager.load_market_config(
         market_address=market_address,
         fetch_from_chain=True,
     )
 
-    return wallet_config, connection_config, market_config
+    return wallet_config, connection_config, cache_config, market_config
 
 
 def load_operational_config(toml_path: Path) -> BotConfig:
@@ -184,4 +187,6 @@ def load_config_from_env():
             "COINBASE_SYMBOL is required when ORACLE=coinbase (e.g. COINBASE_SYMBOL=MON-USD)"
         )
 
-    return wallet_config, connection_config, market_config, bot_config
+
+    return wallet_config, connection_config, cache_config, market_config, bot_config
+

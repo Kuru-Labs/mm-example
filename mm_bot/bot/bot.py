@@ -33,17 +33,19 @@ class Bot:
     for both cancellations and new order placement.
     """
 
-    def __init__(self, connection_config, wallet_config, market_config, bot_config: BotConfig):
+    def __init__(self, connection_config, cache_config, wallet_config, market_config, bot_config: BotConfig):
         """
         Initialize the bot.
 
         Args:
             connection_config: ConnectionConfig instance
+            cache_config: CacheConfig instance
             wallet_config: WalletConfig instance
             market_config: MarketConfig instance
             bot_config: BotConfig instance
         """
         self.connection_config = connection_config
+        self.cache_config = cache_config
         self.wallet_config = wallet_config
         self.market_config = market_config
         self.bot_config = bot_config
@@ -69,6 +71,9 @@ class Bot:
 
         # Pre-registration for immediate fills (orders sent but not yet confirmed)
         self.preregistered_orders: Dict[str, tuple[float, float]] = {}  # cloid → (size, timestamp)
+
+        # Per-order cleanup tasks (cancelled when callback arrives)
+        self._prereg_cleanup_tasks: Dict[str, asyncio.Task] = {}  # cloid → cleanup Task
 
         # Active orders tracked from callbacks (for inventory, no API calls needed)
         self.active_orders: Dict[str, OrderInfo] = {}  # cloid → OrderInfo
@@ -159,6 +164,7 @@ class Bot:
             # Confirm pre-registration (if order was pre-registered)
             if order.cloid in self.preregistered_orders:
                 del self.preregistered_orders[order.cloid]
+                self._cancel_prereg_cleanup(order.cloid)
                 self._debug_log(f"[ORDER] PLACED - {order.cloid} confirmed (was pre-registered)")
 
             # Store initial size for fill calculation (if not already there from pre-reg)
@@ -188,6 +194,7 @@ class Bot:
         # Track cancellations
         elif order.status == OrderStatus.ORDER_CANCELLED:
             self.active_cloids.discard(order.cloid)
+            self._cancel_prereg_cleanup(order.cloid)
             # Clean up mapping
             if order.cloid in self.cloid_to_order_id:
                 order_id = self.cloid_to_order_id[order.cloid]
@@ -206,10 +213,23 @@ class Bot:
 
         # Track fills and update position
         elif order.status == OrderStatus.ORDER_FULLY_FILLED:
+            self._cancel_prereg_cleanup(order.cloid)
+
+            # Infer side from cloid prefix when SDK returns None
+            fill_side = order.side
+            if fill_side is None:
+                from mm_bot.kuru_imports import OrderSide
+                if order.cloid and order.cloid.startswith('bid-'):
+                    fill_side = OrderSide.BUY
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred BUY from cloid prefix")
+                elif order.cloid and order.cloid.startswith('ask-'):
+                    fill_side = OrderSide.SELL
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred SELL from cloid prefix")
+
             self._debug_log(f"[ORDER] FULLY_FILLED event - cloid: {order.cloid}")
-            self._debug_log(f"[ORDER]   side: {order.side.value if order.side else 'None'}")
+            self._debug_log(f"[ORDER]   side: {fill_side.value if fill_side else 'None'}")
             self._debug_log(f"[ORDER]   remaining size: {order.size:.2f}")
-            self._debug_log(f"[ORDER]   price: {order.price:.6f}")
+            self._debug_log(f"[ORDER]   price: {order.price if order.price is not None else 'None'}")
 
             # Calculate filled size - check both order_sizes and preregistered_orders
             previous_size = None
@@ -229,29 +249,42 @@ class Bot:
                 source = "preregistered"
                 del self.preregistered_orders[order.cloid]
 
-            if previous_size is not None:
+            if previous_size is not None and fill_side is not None:
                 filled_size = previous_size - order.size  # order.size should be 0 for fully filled
 
                 self._debug_log(f"[ORDER]   previous size: {previous_size:.2f} (from {source})")
                 self._debug_log(f"[ORDER]   FILLED SIZE: {filled_size:.2f}")
 
+                # Use order.price if available, otherwise log warning (still track position)
+                fill_price = order.price if order.price is not None else 0.0
+                if order.price is None:
+                    self._debug_log(f"[ORDER] ⚠️ price was None, using 0.0 for quote tracking (position still updated)")
+
                 # Update position tracker with actual filled amount
                 self.position_tracker.update_position(
-                    side=order.side,
+                    side=fill_side,
                     filled_size=filled_size,
-                    price=order.price
+                    price=fill_price
                 )
 
                 # SUCCESS
                 self._debug_log(f"[ORDER] Position tracker updated successfully\n")
 
+            elif previous_size is not None and fill_side is None:
+                # Have the size but can't determine side — critical error
+                self._debug_log(f"[ORDER] ⚠️ SKIPPED - Could not determine side for {order.cloid}!")
+                self._debug_log(f"[ORDER] Position NOT updated for {order.cloid}\n")
+                logger.error(
+                    f"⚠️ Fill for {order.cloid}: side is None and could not be inferred - "
+                    f"POSITION NOT UPDATED!"
+                )
             else:
                 # FAILURE - not in either dict
                 self._debug_log(f"[ORDER] ⚠️ SKIPPED - Order not in order_sizes or preregistered!")
                 self._debug_log(f"[ORDER] Position NOT updated for {order.cloid}\n")
                 logger.error(
                     f"⚠️ Fill received for unknown order: {order.cloid} "
-                    f"(side: {order.side.value if order.side else 'N/A'}, "
+                    f"(side: {fill_side.value if fill_side else 'N/A'}, "
                     f"size: {order.size}) - POSITION NOT UPDATED!"
                 )
 
@@ -269,15 +302,29 @@ class Bot:
 
             logger.success(
                 f"✓ Order {order.cloid} filled! "
-                f"Side: {order.side.value if order.side else 'N/A'}, "
+                f"Side: {fill_side.value if fill_side else 'N/A'}, "
                 f"Price: {order.price}"
             )
 
         elif order.status == OrderStatus.ORDER_PARTIALLY_FILLED:
+            # Cancel cleanup task (order is confirmed on-chain via partial fill)
+            self._cancel_prereg_cleanup(order.cloid)
+
+            # Infer side from cloid prefix when SDK returns None
+            fill_side = order.side
+            if fill_side is None:
+                from mm_bot.kuru_imports import OrderSide
+                if order.cloid and order.cloid.startswith('bid-'):
+                    fill_side = OrderSide.BUY
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred BUY from cloid prefix")
+                elif order.cloid and order.cloid.startswith('ask-'):
+                    fill_side = OrderSide.SELL
+                    self._debug_log(f"[ORDER] ⚠️ side was None, inferred SELL from cloid prefix")
+
             self._debug_log(f"[ORDER] PARTIALLY_FILLED event - cloid: {order.cloid}")
-            self._debug_log(f"[ORDER]   side: {order.side.value if order.side else 'None'}")
+            self._debug_log(f"[ORDER]   side: {fill_side.value if fill_side else 'None'}")
             self._debug_log(f"[ORDER]   remaining size: {order.size:.2f}")
-            self._debug_log(f"[ORDER]   price: {order.price:.6f}")
+            self._debug_log(f"[ORDER]   price: {order.price if order.price is not None else 'None'}")
 
             # Calculate filled size - check both order_sizes and preregistered_orders
             previous_size = None
@@ -293,17 +340,21 @@ class Bot:
                 self.order_sizes[order.cloid] = order.size
                 del self.preregistered_orders[order.cloid]
 
-            if previous_size is not None:
+            if previous_size is not None and fill_side is not None:
                 filled_size = previous_size - order.size
 
                 self._debug_log(f"[ORDER]   previous size: {previous_size:.2f} (from {source})")
                 self._debug_log(f"[ORDER]   FILLED SIZE: {filled_size:.2f}")
 
+                fill_price = order.price if order.price is not None else 0.0
+                if order.price is None:
+                    self._debug_log(f"[ORDER] ⚠️ price was None, using 0.0 for quote tracking (position still updated)")
+
                 # Update position tracker with actual filled amount
                 self.position_tracker.update_position(
-                    side=order.side,
+                    side=fill_side,
                     filled_size=filled_size,
-                    price=order.price
+                    price=fill_price
                 )
 
                 # Update stored size for next partial fill
@@ -323,7 +374,7 @@ class Bot:
                 self._debug_log(f"[ORDER] Position NOT updated for {order.cloid}\n")
                 logger.error(
                     f"⚠️ Partial fill received for unknown order: {order.cloid} "
-                    f"(side: {order.side.value if order.side else 'N/A'}, "
+                    f"(side: {fill_side.value if fill_side else 'N/A'}, "
                     f"remaining: {order.size}) - POSITION NOT UPDATED!"
                 )
 
@@ -338,6 +389,7 @@ class Bot:
         logger.info("Creating KuruClient...")
         self.client = await KuruClient.create(
             market_config=self.market_config,
+            cache_config=self.cache_config,
             connection_config=self.connection_config,
             wallet_config=self.wallet_config,
             transaction_config=ConfigManager.load_transaction_config(),
@@ -803,34 +855,41 @@ class Bot:
             import traceback
             logger.error(traceback.format_exc())
 
-    async def _cleanup_stale_preregistrations(self) -> None:
+    def _schedule_prereg_cleanup(self, cloid: str, timeout: float = 30.0) -> None:
         """
-        Clean up pre-registered orders that never received confirmation.
-        Call this periodically (e.g., every 30 seconds).
+        Schedule a per-order cleanup task that fires after `timeout` seconds.
+        If a callback (ORDER_PLACED, CANCELLED, FILLED) arrives before the timeout,
+        the task is cancelled via _cancel_prereg_cleanup().
+
+        Only removes from preregistered_orders — NEVER from order_sizes,
+        which is the safety net for position tracking on late fills.
         """
-        try:
-            current_time = time.time()
-            stale_timeout = 5  # seconds (short timeout since transactions are fast)
+        async def _cleanup_after_timeout():
+            try:
+                await asyncio.sleep(timeout)
+                # Timeout reached — no callback arrived in time
+                if cloid in self.preregistered_orders:
+                    del self.preregistered_orders[cloid]
+                    logger.warning(
+                        f"⚠️ Cleaned up stale pre-registration for {cloid} "
+                        f"(no confirmation after {timeout}s)"
+                    )
+                    self._debug_log(f"[CLEANUP] Removed stale pre-registration: {cloid}")
+                # NOTE: order_sizes is intentionally kept so late fills are still tracked
+            except asyncio.CancelledError:
+                pass  # Callback arrived, cleanup cancelled — this is the happy path
+            finally:
+                self._prereg_cleanup_tasks.pop(cloid, None)
 
-            stale_cloids = []
-            for cloid, (_, timestamp) in self.preregistered_orders.items():
-                age = current_time - timestamp
-                if age > stale_timeout:
-                    stale_cloids.append(cloid)
+        # Cancel any existing cleanup task for this cloid (shouldn't happen, but be safe)
+        self._cancel_prereg_cleanup(cloid)
+        self._prereg_cleanup_tasks[cloid] = asyncio.create_task(_cleanup_after_timeout())
 
-            for cloid in stale_cloids:
-                # Remove from order_sizes (order never confirmed)
-                if cloid in self.order_sizes:
-                    del self.order_sizes[cloid]
-                del self.preregistered_orders[cloid]
-                logger.warning(
-                    f"⚠️ Cleaned up stale pre-registration for {cloid} "
-                    f"(no confirmation after {stale_timeout}s)"
-                )
-                self._debug_log(f"[CLEANUP] Removed stale pre-registration: {cloid}")
-
-        except Exception as e:
-            logger.error(f"Failed to cleanup stale pre-registrations: {e}")
+    def _cancel_prereg_cleanup(self, cloid: str) -> None:
+        """Cancel the per-order cleanup task when a callback arrives."""
+        task = self._prereg_cleanup_tasks.pop(cloid, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _cancel_all_existing_orders(self) -> None:
         """
@@ -857,7 +916,6 @@ class Bot:
         logger.info("🚀 Starting market making loop...\n")
         iteration = 0
         self.last_reconcile_time = time.time()
-        self.last_cleanup_time = time.time()
 
         while not self.shutdown_event.is_set():
             try:
@@ -875,12 +933,6 @@ class Bot:
                         await self._reconcile_position()
                         self.last_reconcile_time = time.time()
 
-                # Periodic cleanup of stale pre-registrations (every 5 seconds)
-                cleanup_interval = 5.0
-                if time.time() - self.last_cleanup_time >= cleanup_interval:
-                    await self._cleanup_stale_preregistrations()
-                    self.last_cleanup_time = time.time()
-
                 # Get reference price from configured oracle
                 reference_price = self.oracle_service.get_price(
                     self.market_config.market_address,
@@ -892,7 +944,7 @@ class Bot:
                     await asyncio.sleep(1.0)
                     continue
 
-                logger.info(f"Iteration {iteration}: Price=${reference_price:.5f}")
+                logger.debug(f"Iteration {iteration}: Price=${reference_price:.5f}")
 
                 # Get current on-chain active orders
                 on_chain_orders = self.client.user.get_active_orders()
@@ -902,7 +954,7 @@ class Bot:
                     reference_price, on_chain_orders
                 )
 
-                logger.info(f"PropMaintain: {num_cancels} cancels, {num_new_orders} new orders")
+                logger.debug(f"PropMaintain: {num_cancels} cancels, {num_new_orders} new orders")
 
                 # Validate balance before placing orders
                 if all_orders:
@@ -921,6 +973,7 @@ class Bot:
                             # Skip cancels, only pre-register new limit orders
                             self.preregistered_orders[order.cloid] = (order.size, time.time())
                             self.order_sizes[order.cloid] = order.size
+                            self._schedule_prereg_cleanup(order.cloid, timeout=30.0)
                             self._debug_log(f"[PRESEND] Pre-registered {order.cloid} with size {order.size}")
 
                     # Single transaction for cancel + place
@@ -961,6 +1014,16 @@ class Bot:
         all_orders = []
         total_cancels = 0
         total_new_orders = 0
+
+        # Check position limits for one-sided quoting
+        current_position = self.position_tracker.get_current_position() + self.position_tracker.get_start_position()
+        stop_bids = current_position > self.bot_config.max_position
+        stop_asks = current_position < -self.bot_config.max_position
+        
+        if stop_bids:
+            logger.debug(f"Position {current_position:.2f} > MAX_POSITION {self.bot_config.max_position:.2f} - STOPPING BID QUOTES")
+        if stop_asks:
+            logger.debug(f"Position {current_position:.2f} < -MAX_POSITION {-self.bot_config.max_position:.2f} - STOPPING ASK QUOTES")
 
         # Build map of on-chain orders by cloid (for our orders only)
         on_chain_by_cloid = {}
@@ -1014,7 +1077,16 @@ class Bot:
                 order_price = float(order.get('price', 0)) / self.market_config.price_precision
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
 
-                if order_edge >= bid_cancel_edge:
+                # Cancel bid if position limit exceeded
+                if stop_bids:
+                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_bid_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling bid @ {order_price:.6f} "
+                        f"(position limit exceeded)"
+                    )
+                elif order_edge >= bid_cancel_edge:
                     # Edge is good, keep the order
                     need_bid = False
                     logger.debug(
@@ -1041,7 +1113,17 @@ class Bot:
                 # Use callback-tracked price for full edge evaluation — eliminates the blind window.
                 order_price = self.active_orders[existing_bid_cloid].price
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
-                if order_edge >= bid_cancel_edge:
+                
+                # Cancel bid if position limit exceeded
+                if stop_bids:
+                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_bid_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling bid @ {order_price:.6f} "
+                        f"(position limit exceeded) [callback]"
+                    )
+                elif order_edge >= bid_cancel_edge:
                     need_bid = False
                     logger.debug(
                         f"Quoter {quoter.baseline_edge_bps}bps: Keeping bid @ {order_price:.6f} "
@@ -1066,7 +1148,16 @@ class Bot:
                 order_price = float(order.get('price', 0)) / self.market_config.price_precision
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
 
-                if order_edge >= ask_cancel_edge:
+                # Cancel ask if position limit exceeded
+                if stop_asks:
+                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_ask_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling ask @ {order_price:.6f} "
+                        f"(position limit exceeded)"
+                    )
+                elif order_edge >= ask_cancel_edge:
                     # Edge is good, keep the order
                     need_ask = False
                     logger.debug(
@@ -1092,7 +1183,17 @@ class Bot:
                 # Use callback-tracked price for full edge evaluation — eliminates the blind window.
                 order_price = self.active_orders[existing_ask_cloid].price
                 order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
-                if order_edge >= ask_cancel_edge:
+                
+                # Cancel ask if position limit exceeded
+                if stop_asks:
+                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
+                    total_cancels += 1
+                    self.active_cloids.discard(existing_ask_cloid)
+                    logger.debug(
+                        f"Quoter {quoter.baseline_edge_bps}bps: Cancelling ask @ {order_price:.6f} "
+                        f"(position limit exceeded) [callback]"
+                    )
+                elif order_edge >= ask_cancel_edge:
                     need_ask = False
                     logger.debug(
                         f"Quoter {quoter.baseline_edge_bps}bps: Keeping ask @ {order_price:.6f} "
@@ -1137,13 +1238,17 @@ class Bot:
                     logger.debug(f"Coupling: cancelling bid {existing_bid_cloid} because ask was replaced")
 
             # Generate new orders for sides that need updating
-            new_quoter_orders = quoter.generate_orders(reference_price, need_bid=need_bid, need_ask=need_ask)
+            # Apply position limits: stop quoting bids if position > max, stop asks if position < -max
+            final_need_bid = need_bid and not stop_bids
+            final_need_ask = need_ask and not stop_asks
+            
+            new_quoter_orders = quoter.generate_orders(reference_price, need_bid=final_need_bid, need_ask=final_need_ask)
             if new_quoter_orders:
                 all_orders.extend(new_quoter_orders)
                 total_new_orders += len(new_quoter_orders)
                 logger.debug(
                     f"Quoter {quoter.baseline_edge_bps}bps: Generating {len(new_quoter_orders)} new orders "
-                    f"(bid={'yes' if need_bid else 'no'}, ask={'yes' if need_ask else 'no'})"
+                    f"(bid={'yes' if final_need_bid else 'no'}, ask={'yes' if final_need_ask else 'no'})"
                 )
 
         return all_orders, total_cancels, total_new_orders
