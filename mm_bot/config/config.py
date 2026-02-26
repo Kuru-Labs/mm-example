@@ -2,7 +2,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 from dotenv import load_dotenv
 
 if sys.version_info >= (3, 11):
@@ -11,6 +11,8 @@ else:
     import tomli as tomllib
 
 from mm_bot.kuru_imports import ConfigManager
+
+SDKConfigs = dict[str, Any]
 
 
 @dataclass
@@ -30,7 +32,7 @@ class BotConfig:
     market_address: Optional[str] = None  # Market address (restart required to change)
 
 
-def load_secrets_from_env(market_address: Optional[str] = None):
+def load_secrets_from_env(market_address: Optional[str] = None) -> SDKConfigs:
     """
     Load secrets (wallet, connection, market) from .env file.
 
@@ -38,30 +40,14 @@ def load_secrets_from_env(market_address: Optional[str] = None):
         market_address: Optional market address (overrides .env if provided)
 
     Returns:
-        tuple: (wallet_config, connection_config, market_config)
+        Dictionary of SDK configs suitable for KuruClient.create(**configs)
     """
     load_dotenv()
-
-    # Load wallet config (reads PRIVATE_KEY from env)
-    wallet_config = ConfigManager.load_wallet_config()
-
-    # Load connection config (reads RPC_URL, RPC_WS_URL, etc. from env with defaults)
-    connection_config = ConfigManager.load_connection_config()
-
-    # Use provided market_address or fall back to .env
-    if market_address is None:
-        market_address = os.getenv("MARKET_ADDRESS", "0x065c9d28e428a0db40191a54d33d5b7c71a9c394")
-
-    # Load cache config
-    cache_config = ConfigManager.load_cache_config()
-
-    # Load market config from chain
-    market_config = ConfigManager.load_market_config(
+    return ConfigManager.load_all_configs(
         market_address=market_address,
         fetch_from_chain=True,
+        auto_env=True,
     )
-
-    return wallet_config, connection_config, cache_config, market_config
 
 
 def load_operational_config(toml_path: Path) -> BotConfig:
@@ -140,20 +126,17 @@ def load_operational_config(toml_path: Path) -> BotConfig:
     )
 
 
-def load_config_from_env():
+def load_config_from_env() -> tuple[SDKConfigs, BotConfig]:
     """
     Load all configurations from environment variables (legacy fallback).
 
     Returns:
-        tuple: (wallet_config, connection_config, market_config, bot_config)
+        tuple: (sdk_configs, bot_config)
     """
     load_dotenv()
 
-    # Load cache config
-    cache_config = ConfigManager.load_cache_config()
-
-    # Load secrets
-    wallet_config, connection_config, market_config = load_secrets_from_env()
+    # Load SDK configs
+    sdk_configs = load_secrets_from_env()
 
     # Load bot config from .env (fallback when TOML doesn't exist)
     quoters_bps_str = os.getenv("QUOTERS_BPS", "25,50,75")
@@ -190,6 +173,4 @@ def load_config_from_env():
             "COINBASE_SYMBOL is required when ORACLE=coinbase (e.g. COINBASE_SYMBOL=MON-USD)"
         )
 
-
-    return wallet_config, connection_config, cache_config, market_config, bot_config
-
+    return sdk_configs, bot_config

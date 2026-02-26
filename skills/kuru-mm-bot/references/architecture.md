@@ -93,8 +93,8 @@ cancel_threshold = edge × (1 - PROP_MAINTAIN)
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `PRIVATE_KEY` | required | No 0x prefix |
-| `RPC_URL` | `https://rpc.fullnode.kuru.io/` | HTTP endpoint |
-| `RPC_WS_URL` | `wss://rpc.fullnode.kuru.io/` | WebSocket endpoint |
+| `RPC_URL` | `https://rpc.monad.xyz` | HTTP endpoint |
+| `RPC_WS_URL` | `wss://rpc.monad.xyz` | WebSocket endpoint |
 | `MARKET_ADDRESS` | required | Kuru market contract |
 | `ORACLE` | `coinbase` | `kuru` (WS mid-price) or `coinbase` (REST API) |
 | `KURU_RPC_LOGS_SUBSCRIPTION` | `monadLogs` | RPC filter mode for Monad |
@@ -135,6 +135,6 @@ To add a new parameter: add to `BotConfig` → read in `load_config_from_env()` 
 
 **Coupling:** If you add logic that replaces one side of a quoter, check whether it should also trigger the coupling block (~line 1090 in `bot.py`) to replace the other side.
 
-**`transaction_config`:** Always pass `ConfigManager.load_transaction_config()` to `KuruClient.create()`. Forgetting it causes silent gas under-estimation: cancels succeed but placements silently fail mid-batch (contract runs out of gas).
+**SDK config wiring:** Always initialize client from full SDK bundle (`KuruClient.create(**sdk_configs)`), where `sdk_configs` comes from `ConfigManager.load_all_configs(...)`.
 
 **Cloid prefix matching:** The quoter-to-order mapping relies on `{side}-{bps}-` prefixes. Don't add extra fields to the cloid format without updating matching logic.

@@ -1,165 +1,101 @@
 # Kuru Market Making Bot
 
-A market making bot for Kuru DEX implementing a skew-based quoting strategy with event-driven order tracking.
+A market-making bot for Kuru DEX using the refactored `kuru-sdk-py` client.
 
-## How It Works
+## What Changed
 
-The bot continuously quotes bid and ask orders around a reference price fetched from the Kuru oracle. It adjusts spreads based on the current position relative to the configured maximum — widening spreads in the entry direction and tightening them in the exit direction. This is the "skew" mechanism.
+This repo now tracks SDK v0.1.9+ behavior:
 
-Each quoting level runs at a configured spread (in basis points). On each iteration, the bot cancels its previous orders and places fresh ones in a single transaction. Position changes are tracked via WebSocket fill callbacks rather than polling.
+- Decimal-native order/position math in bot state and fill handling
+- Full `ConfigManager.load_all_configs(...)` bootstrap path
+- Typed SDK error handling (`Kuru*Error`) for retries and recovery
+- Cancel-all flow aligned with SDK semantics (no tx-hash return assumptions)
 
-### Components
+## Architecture
 
-- **OracleService** (`mm_bot/pricing/oracle.py`) — fetches reference price from the Kuru API
-- **Quoter** (`mm_bot/quoter/quoter.py`) — generates bid/ask orders with skew-based pricing per level
-- **PositionTracker** (`mm_bot/position/position_tracker.py`) — updates position on order fill events
-- **PnlTracker** (`mm_bot/pnl/tracker.py`) — tracks unrealized PnL
-- **Bot** (`mm_bot/bot/bot.py`) — orchestrates the order lifecycle
-- **Config** (`mm_bot/config/config.py`) — loads configuration from environment variables
+Core modules:
 
-## Prerequisites
+- `mm_bot/main.py`: process startup, logging, signal handling
+- `mm_bot/config/config.py`: loads operational config (`bot_config.toml`) and SDK config bundle
+- `mm_bot/bot/bot.py`: quoting loop, order lifecycle callbacks, cancellation/reconciliation, typed recovery
+- `mm_bot/quoter/quoter.py`: skewed bid/ask generation
+- `mm_bot/position/position_tracker.py`: Decimal-native position persistence (`tracking/position_state.json`)
+- `mm_bot/pricing/oracle.py`: oracle sources (`kuru` websocket or `coinbase` REST)
+- `mm_bot/pnl/tracker.py`: Decimal-native PnL display
 
-- Python 3.10+
-- The `kuru-sdk-py` package from PyPI
+## Install
 
-## Installation
-
-**1. Clone and set up a virtual environment:**
 ```bash
 git clone https://github.com/kuru-labs/mm-example.git
 cd mm-example
 python3 -m venv venv
 source venv/bin/activate
-```
-
-**2. Install dependencies (includes `kuru-sdk-py` from PyPI):**
-```bash
 pip install -r requirements.txt
-```
-
-Or use the install script:
-```bash
-./install.sh
-```
-
-**3. Configure environment variables:**
-```bash
-cp .env.example .env
-# Edit .env with your settings
 ```
 
 ## Configuration
 
-Create a `.env` file in the project root. All required and optional variables are listed below.
+The bot uses:
 
-### Required
+1. `bot_config.toml` for strategy/operational settings
+2. `.env` for secrets and SDK runtime settings
 
-| Variable | Description |
-|----------|-------------|
-| `PRIVATE_KEY` | Wallet private key (no `0x` prefix) |
-| `MARKET_ADDRESS` | Kuru market contract address |
+### Required `.env`
 
-### Optional (with defaults)
+- `PRIVATE_KEY`
+- `MARKET_ADDRESS` (required unless `strategy.market_address` is set in `bot_config.toml`)
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RPC_URL` | HTTP RPC endpoint | `https://rpc.fullnode.kuru.io/` |
-| `RPC_WS_URL` | WebSocket RPC endpoint | `wss://rpc.fullnode.kuru.io/` |
-| `MAX_POSITION` | Maximum position size in base asset | `1000` |
-| `QUANTITY` | Order size per quoter level | `100` |
-| `QUOTERS_BPS` | Comma-separated spread levels in bps | `25,50,75` |
-| `PRICE_UPDATE_THRESHOLD_BPS` | Minimum price move (bps) before refreshing orders | `10` |
-| `POSITION_UPDATE_THRESHOLD_BPS` | Position change (bps of max) that triggers refresh | `500` |
-| `PROP_SKEW_ENTRY` | Spread widening factor when entering (0–1) | `0.5` |
-| `PROP_SKEW_EXIT` | Spread tightening factor when exiting (0–1) | `0.5` |
-| `STRATEGY_TYPE` | `long` or `short` | `long` |
-| `QUANTITY_BPS_PER_LEVEL` | If set, overrides `QUANTITY` with a position-proportional size | — |
-| `OVERRIDE_START_POSITION` | Manually set initial position (skips on-chain fetch) | — |
-| `RECONCILE_INTERVAL` | Seconds between position reconciliation (0 = disabled) | `300` |
+### Common SDK `.env` settings
 
-### Strategy Types
+- `RPC_URL` (default `https://rpc.monad.xyz`)
+- `RPC_WS_URL` (default `wss://rpc.monad.xyz`)
+- `KURU_WS_URL` (default `wss://ws.kuru.io/`)
+- `KURU_API_URL` (default `https://api.kuru.io/`)
+- `KURU_RPC_LOGS_SUBSCRIPTION` (default `monadLogs`)
+- `KURU_GAS_BUFFER_MULTIPLIER` (default from SDK)
+- `KURU_USE_ACCESS_LIST` (`true`/`false`)
+- `KURU_POST_ONLY` (`true`/`false`)
+- `KURU_RPC_WS_MAX_RECONNECT_ATTEMPTS`
+- `KURU_RPC_WS_RECONNECT_DELAY`
+- `KURU_RPC_WS_MAX_RECONNECT_DELAY`
+- `KURU_RECONCILIATION_INTERVAL`
+- `KURU_RECONCILIATION_THRESHOLD`
 
-- **`long`**: Widen bid spreads when long (slow to enter), tighten ask spreads (eager to exit)
-- **`short`**: Tighten bid spreads when short (eager to exit), widen ask spreads (slow to enter)
+See `.env.example` and `bot_config.example.toml`.
 
-### Skew Example
-
-With `baseline_edge = 50 bps`, `PROP_SKEW_ENTRY = 0.5`, and position at 50% of max using the `long` strategy:
-- Bid edge = `50 × (1 + 0.5 × 0.5)` = **62.5 bps**
-- Ask edge = `50 × (1 - 0.5 × 0.5)` = **37.5 bps**
-
-## Running the Bot
+## Run
 
 ```bash
 ./run.sh
 ```
 
-Or manually:
+or:
+
 ```bash
 source venv/bin/activate
 PYTHONPATH=. python3 mm_bot/main.py
 ```
 
-Press `Ctrl+C` to stop — the bot will cancel all active orders before exiting.
+## Runtime Notes
 
-## Monitoring
-
-The bot logs order activity, fills, position changes, and PnL to stdout:
-
-```
-INFO: Iteration 42: Placing 6 orders, cancelling 6
-INFO: Transaction hash: 0x1234...
-✓ Order bid-50-1706789123456 filled! Side: buy, Price: 0.0195, Size: 100
-INFO: Position update (BUY): +100 base @ 0.0195 | Total: 100
-INFO: PnL: -1.95
-```
-
-## Project Structure
-
-```
-mm-example/
-├── mm_bot/
-│   ├── main.py                    # Entry point
-│   ├── bot/
-│   │   └── bot.py                 # Main bot logic
-│   ├── quoter/
-│   │   └── quoter.py              # Skew-based quoter
-│   ├── position/
-│   │   └── position_tracker.py    # Position tracking
-│   ├── pricing/
-│   │   └── oracle.py              # Price oracle
-│   ├── pnl/
-│   │   └── tracker.py             # PnL tracker
-│   └── config/
-│       └── config.py              # Configuration loader
-├── run.sh                         # Bot runner script
-├── install.sh                     # Dependency installer
-├── requirements.txt               # Python dependencies
-└── .env.example                   # Environment variable template
-```
+- Position state is persisted as Decimal-safe values in `tracking/position_state.json`.
+- Terminal order states now include `ORDER_TIMEOUT` and `ORDER_FAILED` handling.
+- SDK typed errors are classified for retry vs skip behavior:
+  - execution errors: `KuruInsufficientFundsError`, `KuruContractError`, `KuruOrderError`
+  - connectivity errors: `KuruConnectionError`, `KuruWebSocketError`, `KuruTimeoutError`
+  - API/auth errors: `KuruAuthorizationError`
 
 ## Troubleshooting
 
-**Orders not placing**
-- Verify you have sufficient margin balances (base and quote) on the market
-- Confirm `MARKET_ADDRESS` is correct for the asset you intend to trade
-
-**Position drift**
-- All fill events are logged — check logs for any gaps
-- Adjust `RECONCILE_INTERVAL` to reconcile position against on-chain state periodically
-
-**WebSocket disconnects**
-- The SDK has built-in auto-reconnect
-- Check that `RPC_WS_URL` is reachable from your network
-
-**No reference price**
-- The bot skips iterations when the oracle returns no price
-- Check Kuru API availability
-
-## Security
-
-- Never commit your `.env` file — it contains your private key
-- Use a dedicated wallet with only the funds needed for market making
+- Orders not placing:
+  - Check margin balances and wallet gas balance
+  - Confirm market address and token decimals from on-chain market config
+- Frequent retries:
+  - Check RPC/WebSocket health
+  - Tune `KURU_RPC_WS_*` and `KURU_RECONCILIATION_*`
+- No reference price:
+  - Verify selected oracle source in `bot_config.toml`
+  - Check connectivity to Kuru WS or Coinbase API
 
 ## License
 

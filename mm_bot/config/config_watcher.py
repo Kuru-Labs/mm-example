@@ -244,6 +244,7 @@ class ConfigWatcher:
                 quoters_bps=[float(x) for x in strategy["quoters_bps"]],
                 oracle_source=strategy["oracle_source"],
                 coinbase_symbol=strategy.get("coinbase_symbol"),
+                market_address=strategy.get("market_address"),
                 override_start_position=(
                     float(strategy["override_start_position"])
                     if strategy.get("override_start_position") is not None
