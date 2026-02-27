@@ -3,10 +3,11 @@
 ## Table of Contents
 1. [Bot Tracking Dicts](#bot-tracking-dicts)
 2. [Order Lifecycle](#order-lifecycle)
-3. [Quoter Skew Formula](#quoter-skew-formula)
-4. [Environment Variables](#environment-variables)
-5. [Orphan Detection](#orphan-detection)
-6. [Common Pitfalls](#common-pitfalls)
+3. [Pluggable Quoter System](#pluggable-quoter-system)
+4. [SkewQuoter Formula](#skewquoter-formula)
+5. [Environment Variables](#environment-variables)
+6. [Orphan Detection](#orphan-detection)
+7. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -64,13 +65,78 @@ ORDER_CANCELLED callback
 
 **Immediate fill handling:** an order can be fully filled before ORDER_PLACED fires. `preregistered_orders` is populated before `place_orders()` and cleaned in the FULLY_FILLED handler to cover this path.
 
-**Position total** = `start_position + current_position`. Both `Quoter` and reconciliation use the total, not just `current_position`.
+**Position total** = `start_position + current_position`. Both quoters and reconciliation use the total, not just `current_position`.
 
 ---
 
-## Quoter Skew Formula
+## Pluggable Quoter System
 
-`Quoter.get_bid_ask_edges()` adjusts edges based on `prop = position / max_position` (capped ±1):
+### Overview
+
+Each quoter manages one bid/ask pair at one spread level. The bot resolves order state into a `QuoterContext` snapshot and passes it to each quoter's `decide()` method. The quoter returns a `QuoterDecision` (cloids to cancel + orders to place) without touching any bot internals.
+
+### QuoterContext fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reference_price` | `Decimal` | Current fair price from oracle |
+| `current_position` | `Decimal` | Net position (positive = long) |
+| `max_position` | `Decimal` | Position limit from config |
+| `existing_bid` | `ExistingOrder?` | Bot's current bid for this quoter |
+| `existing_ask` | `ExistingOrder?` | Bot's current ask for this quoter |
+| `stop_bids` | `bool` | `True` if position ≥ max_position |
+| `stop_asks` | `bool` | `True` if position ≤ -max_position |
+| `prop_maintain` | `float` | Cancel threshold factor |
+| `price_precision` | `Decimal` | Market price precision |
+
+`QuoterContext` is frozen — quoters cannot mutate it.
+
+### ExistingOrder.source values
+
+| Source | Meaning |
+|--------|---------|
+| `"on_chain"` | Confirmed in REST API result; price is reliable |
+| `"callback"` | Confirmed via ORDER_PLACED callback; REST API hasn't indexed yet |
+| `"preregistered"` | Just sent via `place_orders()`; awaiting confirmation |
+| `"unknown"` | In `active_cloids` but not in `active_orders`; unexpected state |
+
+### Order resolution priority in `_resolve_existing_orders()`
+
+1. `on_chain_by_cloid` (REST API) → source `"on_chain"`
+2. `preregistered_orders` (fallback if not in active_cloids) → source `"preregistered"`
+3. `active_orders` (callback-confirmed, REST API lag) → source `"callback"`
+4. `active_cloids` only → source `"unknown"`
+
+### Implementing a custom quoter
+
+```python
+from mm_bot.quoter.base import BaseQuoter
+from mm_bot.quoter.context import QuoterContext, QuoterDecision
+from mm_bot.quoter.registry import register_quoter
+
+class MyQuoter(BaseQuoter):
+    def decide(self, ctx: QuoterContext) -> QuoterDecision:
+        # ... your logic ...
+        return QuoterDecision(cancels=[...], new_orders=[...])
+
+    @classmethod
+    def from_config(cls, config_section: dict) -> "MyQuoter":
+        return cls(...)
+
+register_quoter("my_quoter", MyQuoter)
+```
+
+Available helper methods on `BaseQuoter`:
+- `make_cloid(side)` → `"bid-{quoter_id}-{timestamp_ms}"`
+- `price_from_edge(edge_bps, side, ref_price)` → price
+- `calculate_order_edge(order_price, side, ref_price)` → edge in bps
+- `cloid_prefix_bid` / `cloid_prefix_ask` properties
+
+---
+
+## SkewQuoter Formula
+
+`SkewQuoter._get_skewed_edges()` adjusts edges based on `prop = position / max_position` (capped ±1):
 
 ```python
 if prop > 0:  # long → eager to sell, reluctant to buy more
@@ -80,11 +146,10 @@ else:         # short → eager to buy, reluctant to sell more
     bid_edge = baseline × (1 - prop × prop_skew_exit)    # tighter bid
     ask_edge = baseline × (1 + prop × prop_skew_entry)   # wider ask
 
-cancel_threshold = edge × (1 - PROP_MAINTAIN)
+cancel_threshold = edge × (1 - prop_maintain)
 ```
 
-`get_cancel_edges(prop_maintain)` returns `(bid_cancel_edge, ask_cancel_edge)`.
-`calculate_order_edge(price, side, ref_price)` returns the current edge in bps of an existing order.
+Keep if `order_edge >= cancel_threshold`, cancel otherwise. Coupling: if one side is cancelled+replaced, the other is force-replaced to stay in sync.
 
 ---
 
@@ -111,7 +176,7 @@ cancel_threshold = edge × (1 - PROP_MAINTAIN)
 | `POSITION_UPDATE_THRESHOLD_BPS` | `500` | Drift alert threshold |
 | `KURU_GAS_BUFFER_MULTIPLIER` | SDK default (1.1×) | Read by `ConfigManager.load_transaction_config()` |
 
-To add a new parameter: add to `BotConfig` → read in `load_config_from_env()` → pass to `Quoter.__init__()` → use in `get_bid_ask_edges()` or `get_cancel_edges()`.
+To add a new parameter: add to `BotConfig` → read in `load_operational_config()` → include in `QuoterContext` if needed by quoters.
 
 ---
 
@@ -133,8 +198,8 @@ To add a new parameter: add to `BotConfig` → read in `load_config_from_env()` 
 
 **Immediate fills:** An order can be filled before ORDER_PLACED fires. Always populate `preregistered_orders` before `place_orders()`, and always clean it up in FULLY_FILLED.
 
-**Coupling:** If you add logic that replaces one side of a quoter, check whether it should also trigger the coupling block (~line 1090 in `bot.py`) to replace the other side.
+**Coupling in custom quoters:** If your quoter replaces one side but holds the other, consider whether they should be re-priced together. `SkewQuoter` force-replaces both sides on any replacement to keep them priced off the same reference.
 
 **SDK config wiring:** Always initialize client from full SDK bundle (`KuruClient.create(**sdk_configs)`), where `sdk_configs` comes from `ConfigManager.load_all_configs(...)`.
 
-**Cloid prefix matching:** The quoter-to-order mapping relies on `{side}-{bps}-` prefixes. Don't add extra fields to the cloid format without updating matching logic.
+**Cloid prefix matching:** Quoter-to-order mapping relies on `cloid_prefix_bid` / `cloid_prefix_ask` on `BaseQuoter`. `quoter_id` must be unique across all quoters in a bot instance. Don't use the same `quoter_id` for two different quoters.
