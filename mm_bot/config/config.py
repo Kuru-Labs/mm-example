@@ -30,6 +30,8 @@ class BotConfig:
     oracle_source: str = "coinbase"  # "kuru" for Kuru orderbook mid, "coinbase" for Coinbase API
     coinbase_symbol: Optional[str] = None  # Required when oracle_source="coinbase"
     market_address: Optional[str] = None  # Market address (restart required to change)
+    quoter_type: str = "skew"  # Default quoter type for flat config (used with quoters_bps)
+    quoters_config: Optional[List[dict]] = None  # Per-quoter config for mixed types ([[strategy.quoters]])
 
 
 def load_secrets_from_env(market_address: Optional[str] = None) -> SDKConfigs:
@@ -77,21 +79,40 @@ def load_operational_config(toml_path: Path) -> BotConfig:
 
     strategy = config_dict["strategy"]
 
+    # Check if using per-quoter config ([[strategy.quoters]]) or flat config
+    has_quoters_config = "quoters" in strategy and isinstance(strategy["quoters"], list)
+
     # Validate required parameters
-    required_params = [
-        "prop_maintain",
-        "reconcile_interval",
-        "max_position",
-        "prop_skew_entry",
-        "prop_skew_exit",
-        "quantity",
-        "quoters_bps",
-        "oracle_source",
-    ]
+    # When using [[strategy.quoters]], quoters_bps and per-quoter params in [strategy] are optional
+    if has_quoters_config:
+        required_params = [
+            "prop_maintain",
+            "reconcile_interval",
+            "oracle_source",
+        ]
+    else:
+        required_params = [
+            "prop_maintain",
+            "reconcile_interval",
+            "max_position",
+            "prop_skew_entry",
+            "prop_skew_exit",
+            "quantity",
+            "quoters_bps",
+            "oracle_source",
+        ]
 
     for param in required_params:
         if param not in strategy:
             raise ValueError(f"Missing required parameter: {param}")
+
+    # Validate per-quoter configs
+    if has_quoters_config:
+        for i, q in enumerate(strategy["quoters"]):
+            if "type" not in q:
+                raise ValueError(f"quoters[{i}] missing required field 'type'")
+            if "quantity" not in q and "quantity" not in strategy:
+                raise ValueError(f"quoters[{i}] missing 'quantity' (not in quoter config or [strategy])")
 
     # Validate oracle_source and coinbase_symbol
     if strategy["oracle_source"] not in ["kuru", "coinbase"]:
@@ -105,16 +126,16 @@ def load_operational_config(toml_path: Path) -> BotConfig:
     return BotConfig(
         prop_maintain=float(strategy["prop_maintain"]),
         reconcile_interval=float(strategy["reconcile_interval"]),
-        max_position=float(strategy["max_position"]),
-        prop_skew_entry=float(strategy["prop_skew_entry"]),
-        prop_skew_exit=float(strategy["prop_skew_exit"]),
-        quantity=float(strategy["quantity"]),
+        max_position=float(strategy.get("max_position", 0)),
+        prop_skew_entry=float(strategy.get("prop_skew_entry", 0.5)),
+        prop_skew_exit=float(strategy.get("prop_skew_exit", 0.5)),
+        quantity=float(strategy.get("quantity", 0)),
         quantity_bps_per_level=(
             float(strategy["quantity_bps_per_level"])
             if strategy.get("quantity_bps_per_level") is not None
             else None
         ),
-        quoters_bps=[float(x) for x in strategy["quoters_bps"]],
+        quoters_bps=[float(x) for x in strategy["quoters_bps"]] if "quoters_bps" in strategy else [],
         oracle_source=strategy["oracle_source"],
         coinbase_symbol=strategy.get("coinbase_symbol"),
         market_address=strategy.get("market_address"),
@@ -123,6 +144,8 @@ def load_operational_config(toml_path: Path) -> BotConfig:
             if strategy.get("override_start_position") is not None
             else None
         ),
+        quoter_type=strategy.get("quoter_type", "skew"),
+        quoters_config=strategy.get("quoters") if has_quoters_config else None,
     )
 
 
