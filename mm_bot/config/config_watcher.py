@@ -164,6 +164,7 @@ class ConfigWatcher:
                 return None
 
             strategy = config_dict["strategy"]
+            has_quoters_config = "quoters" in strategy and isinstance(strategy["quoters"], list)
 
             # Validate all parameters
             errors = []
@@ -181,33 +182,45 @@ class ConfigWatcher:
                     f"Invalid reconcile_interval: {strategy['reconcile_interval']} (must be >= 0.0)"
                 )
 
-            # Reinit-required params
-            if "max_position" not in strategy:
-                errors.append("Missing max_position")
-            elif not validate_max_position(strategy["max_position"]):
-                errors.append(f"Invalid max_position: {strategy['max_position']} (must be > 0.0)")
+            # Reinit-required params (only required for flat config, not per-quoter config)
+            if not has_quoters_config:
+                if "max_position" not in strategy:
+                    errors.append("Missing max_position")
+                elif not validate_max_position(strategy["max_position"]):
+                    errors.append(f"Invalid max_position: {strategy['max_position']} (must be > 0.0)")
 
-            if "prop_skew_entry" not in strategy:
-                errors.append("Missing prop_skew_entry")
-            elif not validate_prop_skew(strategy["prop_skew_entry"]):
-                errors.append(f"Invalid prop_skew_entry: {strategy['prop_skew_entry']} (must be >= 0.0)")
+                if "prop_skew_entry" not in strategy:
+                    errors.append("Missing prop_skew_entry")
+                elif not validate_prop_skew(strategy["prop_skew_entry"]):
+                    errors.append(f"Invalid prop_skew_entry: {strategy['prop_skew_entry']} (must be >= 0.0)")
 
-            if "prop_skew_exit" not in strategy:
-                errors.append("Missing prop_skew_exit")
-            elif not validate_prop_skew(strategy["prop_skew_exit"]):
-                errors.append(f"Invalid prop_skew_exit: {strategy['prop_skew_exit']} (must be >= 0.0)")
+                if "prop_skew_exit" not in strategy:
+                    errors.append("Missing prop_skew_exit")
+                elif not validate_prop_skew(strategy["prop_skew_exit"]):
+                    errors.append(f"Invalid prop_skew_exit: {strategy['prop_skew_exit']} (must be >= 0.0)")
 
-            if "quantity" not in strategy:
-                errors.append("Missing quantity")
-            elif not validate_quantity(strategy["quantity"]):
-                errors.append(f"Invalid quantity: {strategy['quantity']} (must be > 0.0)")
+                if "quantity" not in strategy:
+                    errors.append("Missing quantity")
+                elif not validate_quantity(strategy["quantity"]):
+                    errors.append(f"Invalid quantity: {strategy['quantity']} (must be > 0.0)")
 
-            if "quoters_bps" not in strategy:
-                errors.append("Missing quoters_bps")
-            elif not validate_quoters_bps(strategy["quoters_bps"]):
-                errors.append(
-                    f"Invalid quoters_bps: {strategy['quoters_bps']} (must be non-empty list of positive numbers)"
-                )
+                if "quoters_bps" not in strategy:
+                    errors.append("Missing quoters_bps")
+                elif not validate_quoters_bps(strategy["quoters_bps"]):
+                    errors.append(
+                        f"Invalid quoters_bps: {strategy['quoters_bps']} (must be non-empty list of positive numbers)"
+                    )
+            else:
+                # Validate per-quoter configs
+                if len(strategy["quoters"]) == 0:
+                    errors.append("[[strategy.quoters]] must have at least one entry")
+                for i, q in enumerate(strategy["quoters"]):
+                    if "type" not in q:
+                        errors.append(f"quoters[{i}] missing required field 'type'")
+
+                # Validate optional top-level params if present
+                if "max_position" in strategy and not validate_max_position(strategy["max_position"]):
+                    errors.append(f"Invalid max_position: {strategy['max_position']} (must be > 0.0)")
 
             # Optional params
             if "oracle_source" not in strategy:
@@ -232,16 +245,16 @@ class ConfigWatcher:
             return BotConfig(
                 prop_maintain=float(strategy["prop_maintain"]),
                 reconcile_interval=float(strategy["reconcile_interval"]),
-                max_position=float(strategy["max_position"]),
-                prop_skew_entry=float(strategy["prop_skew_entry"]),
-                prop_skew_exit=float(strategy["prop_skew_exit"]),
-                quantity=float(strategy["quantity"]),
+                max_position=float(strategy.get("max_position", 0)),
+                prop_skew_entry=float(strategy.get("prop_skew_entry", 0.5)),
+                prop_skew_exit=float(strategy.get("prop_skew_exit", 0.5)),
+                quantity=float(strategy.get("quantity", 0)),
                 quantity_bps_per_level=(
                     float(strategy["quantity_bps_per_level"])
                     if strategy.get("quantity_bps_per_level") is not None
                     else None
                 ),
-                quoters_bps=[float(x) for x in strategy["quoters_bps"]],
+                quoters_bps=[float(x) for x in strategy["quoters_bps"]] if "quoters_bps" in strategy else [],
                 oracle_source=strategy["oracle_source"],
                 coinbase_symbol=strategy.get("coinbase_symbol"),
                 market_address=strategy.get("market_address"),
@@ -250,6 +263,8 @@ class ConfigWatcher:
                     if strategy.get("override_start_position") is not None
                     else None
                 ),
+                quoter_type=strategy.get("quoter_type", "skew"),
+                quoters_config=strategy.get("quoters") if has_quoters_config else None,
             )
 
         except Exception as e:

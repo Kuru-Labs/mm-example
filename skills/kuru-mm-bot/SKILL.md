@@ -1,6 +1,6 @@
 ---
 name: kuru-mm-bot
-description: Specialized knowledge for coding on the Kuru market making bot (mm-example repository). Use when working on any task involving order tracking, PropMaintain strategy, position management, quoter logic, bot configuration, or the order lifecycle. Provides critical architectural context that prevents common mistakes — load this before making any changes to bot.py, quoter.py, or config.py.
+description: Specialized knowledge for coding on the Kuru market making bot (mm-example repository). Use when working on any task involving order tracking, PropMaintain strategy, position management, quoter logic, bot configuration, or the order lifecycle. Provides critical architectural context that prevents common mistakes — load this before making any changes to bot.py, quoter files, or config.py.
 ---
 
 # Kuru Market Making Bot
@@ -22,9 +22,13 @@ Logs → `tracking/bot_run_YYYYMMDD_HHMMSS.log`. Position persists across restar
 | File | Role |
 |------|------|
 | `mm_bot/main.py` | Entry point, logging setup, signal handlers |
-| `mm_bot/bot/bot.py` | All strategy logic (~1270 lines) |
-| `mm_bot/quoter/quoter.py` | Bid/ask price + cancel threshold calculation |
-| `mm_bot/config/config.py` | `BotConfig` dataclass, loads `.env` |
+| `mm_bot/bot/bot.py` | All strategy orchestration, order lifecycle |
+| `mm_bot/quoter/base.py` | `BaseQuoter` ABC — implement `decide(ctx) -> QuoterDecision` |
+| `mm_bot/quoter/context.py` | `QuoterContext` (frozen snapshot) and `QuoterDecision` |
+| `mm_bot/quoter/skew_quoter.py` | Built-in `SkewQuoter` — position skew + PropMaintain |
+| `mm_bot/quoter/registry.py` | `register_quoter()` / `get_quoter_class()` |
+| `mm_bot/quoter/quoter.py` | Backward-compat shim (`SkewQuoter as Quoter`) |
+| `mm_bot/config/config.py` | `BotConfig` dataclass, TOML + `.env` loading |
 | `mm_bot/kuru_imports.py` | **Single shim for all SDK imports** — always import from here |
 
 The root-level `kuru_imports.py` is unused dead code. Do not import from it.
@@ -42,10 +46,10 @@ Do not bypass bundle-based initialization with partial ad-hoc config wiring. Kee
 
 **3. Cloid format is load-bearing:**
 ```
-{side}-{baseline_edge_bps}-{timestamp_ms}
+{side}-{quoter_id}-{timestamp_ms}
 # e.g.  bid-1.0-1771500973306   ask-15.0-1771500975944
 ```
-Quoter-to-order matching uses prefix `bid-{bps}-` / `ask-{bps}-`. Changing the format requires updating the matching logic in `_generate_orders_with_prop_maintain()`.
+For `SkewQuoter`, `quoter_id = str(Decimal(str(baseline_edge_bps)))`. Matching uses `quoter.cloid_prefix_bid` / `quoter.cloid_prefix_ask`. Changing format requires updating matching logic in `_resolve_existing_orders()`.
 
 ## Order Tracking: Callbacks, Not REST API
 
@@ -53,16 +57,26 @@ The REST API lags ~2 seconds behind on-chain events. The bot tracks order state 
 
 REST API is only used for: startup cleanup, orphan detection validation, and shutdown.
 
-## PropMaintain Check Chain
+## Order Generation Flow
 
-For each quoter + side, `_generate_orders_with_prop_maintain()` checks the existing order in priority order:
+Each iteration, `_generate_orders()` in `bot.py`:
 
-1. Found in REST API result → edge check using API price
-2. In `preregistered_orders` → just sent, awaiting confirmation → hold
-3. In `active_orders` → confirmed via callback, REST API not yet indexed → full edge check using callback price (logs `[callback]`)
-4. In `active_cloids` but not `active_orders` → unknown state → hold
+1. Calls `_resolve_existing_orders(quoter, on_chain_by_cloid)` — scans tracking dicts, returns `ExistingOrder` objects with `source` set to `"on_chain"`, `"callback"`, `"preregistered"`, or `"unknown"`
+2. Builds a frozen `QuoterContext` snapshot (price, position, existing orders, stop flags)
+3. Calls `quoter.decide(ctx)` — the quoter returns `QuoterDecision(cancels, new_orders)`
+4. Discards cancelled cloids from `active_cloids`, batches all orders into `place_orders()`
 
-If one side of a quoter is replaced, the **coupling block** force-replaces the other side too (~line 1090 in `bot.py`). This ensures both bid and ask always share the same reference price.
+The old `_generate_orders_with_prop_maintain` method has been replaced by this flow. All per-quoter cancel/maintain logic now lives in the quoter's `decide()` method.
+
+## PropMaintain Check Chain (SkewQuoter)
+
+`SkewQuoter.decide()` evaluates each side's existing order by `source`:
+
+1. `"preregistered"` → just sent, awaiting confirmation → hold
+2. `"unknown"` → in `active_cloids` but not `active_orders` → hold
+3. `"on_chain"` or `"callback"` → compute edge; keep if `edge >= baseline × (1 - prop_maintain)`, else cancel
+
+If one side of a quoter is replaced, the **coupling block** inside `decide()` force-replaces the other side too. This ensures both bid and ask always share the same reference price.
 
 ## Shutdown
 

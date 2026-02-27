@@ -41,8 +41,13 @@ quantity = 400
 # Comment out or omit to use fixed quantity instead
 # quantity_bps_per_level = 2000
 
+# Quoter type for flat config (default: "skew")
+# Built-in types: "skew" (position-skew with PropMaintain)
+# Custom quoters: implement BaseQuoter, then register_quoter("my_type", MyQuoter)
+quoter_type = "skew"
+
 # Quoter levels in basis points from mid
-# Each value creates a bid/ask pair at that spread
+# Each value creates a bid/ask pair at that spread using the quoter_type above
 # Example: [1, 10, 15] creates quotes at 1bps, 10bps, and 15bps from mid
 # Range: non-empty list of positive numbers
 quoters_bps = [1, 10, 15]
@@ -67,3 +72,31 @@ coinbase_symbol = "MON-USD"
 # Comment out or omit to start from saved position state
 # Changing requires restart to apply
 # override_start_position = 1000.0
+
+
+# --- ALTERNATIVE: Per-quoter config (mixed types) ---
+# Use [[strategy.quoters]] instead of quoters_bps to configure each quoter
+# independently — including mixing different quoter types.
+# When this section is present, quoters_bps and quoter_type above are ignored.
+#
+# Each entry requires at minimum: type, baseline_edge_bps, quantity
+# Type-specific params (e.g. prop_skew_entry) are passed to the quoter's from_config()
+#
+# [[strategy.quoters]]
+# type = "skew"
+# baseline_edge_bps = 1.0
+# quantity = 1000
+# prop_skew_entry = 0.5
+# prop_skew_exit = 0.5
+#
+# [[strategy.quoters]]
+# type = "skew"
+# baseline_edge_bps = 15.0
+# quantity = 500
+# prop_skew_entry = 0.8    # tighter entry skew at wide level
+# prop_skew_exit = 0.3     # more patient exit skew at wide level
+#
+# [[strategy.quoters]]
+# type = "my_custom_quoter"   # registered via register_quoter()
+# my_param = "value"
+# quantity = 200
