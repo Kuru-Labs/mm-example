@@ -1,43 +1,124 @@
 # Kuru Market Making Bot
 
-A market-making bot for Kuru DEX using the refactored `kuru-sdk-py` client.
+An async market-making bot for [Kuru DEX](https://kuru.io) on Monad. Maintains bid/ask quotes using a **PropMaintain** strategy — only cancels and replaces orders whose edge has drifted below a threshold, minimizing gas costs.
 
-## What Changed
+## Quick Start
 
-This repo now tracks SDK v0.1.9+ behavior:
+```bash
+git clone https://github.com/kuru-labs/mm-example.git
+cd mm-example
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+```
 
-- Decimal-native order/position math in bot state and fill handling
-- Full `ConfigManager.load_all_configs(...)` bootstrap path
-- Typed SDK error handling (`Kuru*Error`) for retries and recovery
-- Cancel-all flow aligned with SDK semantics (no tx-hash return assumptions)
-- Pluggable quoter system — implement `BaseQuoter.decide()` to plug in your own strategy
+```bash
+cp .env.example .env
+cp bot_config.example.toml bot_config.toml
+```
+
+Set your credentials in `.env`:
+```
+PRIVATE_KEY=your_private_key_without_0x
+```
+
+Set your market in `bot_config.toml`:
+```toml
+market_address = "0x..."
+oracle_source = "kuru"   # or "coinbase" (requires coinbase_symbol)
+```
+
+```bash
+PYTHONPATH=. python3 -m mm_bot.main
+```
+
+Logs appear under `tracking/`.
+
+---
+
+## Configuration
+
+The bot uses two config files:
+
+- **`bot_config.toml`** — strategy and operational settings (hot-reloadable)
+- **`.env`** — secrets and SDK runtime settings
+
+### Required `.env` keys
+
+| Key | Notes |
+|-----|-------|
+| `PRIVATE_KEY` | No `0x` prefix |
+| `MARKET_ADDRESS` | Can also be set in `bot_config.toml` as `strategy.market_address` |
+
+### Common SDK `.env` settings
+
+| Key | Default |
+|-----|---------|
+| `RPC_URL` | `https://rpc.monad.xyz` |
+| `RPC_WS_URL` | `wss://rpc.monad.xyz` |
+| `KURU_WS_URL` | `wss://ws.kuru.io/` |
+| `KURU_API_URL` | `https://api.kuru.io/` |
+| `KURU_RPC_LOGS_SUBSCRIPTION` | `monadLogs` |
+| `KURU_GAS_BUFFER_MULTIPLIER` | SDK default |
+| `KURU_USE_ACCESS_LIST` | `true`/`false` |
+| `KURU_POST_ONLY` | `true`/`false` |
+
+### Key `bot_config.toml` parameters
+
+Hot-reloadable (no restart needed):
+
+| Parameter | Description |
+|-----------|-------------|
+| `prop_maintain` | Cancel threshold — `0.2` means cancel if edge drops below 80% of target |
+| `reconcile_interval` | Seconds between position reconciliation (`0` = disabled) |
+
+Full reinit on change (brief trading pause):
+
+| Parameter | Description |
+|-----------|-------------|
+| `quoters_bps` | Spread levels in bps — `[1, 10, 15]` creates 3 bid/ask pairs |
+| `quoter_type` | Quoter strategy — built-in: `"skew"` |
+| `quantity` | Order size per level per side (base token units) |
+| `max_position` | Inventory cap — bot skews quotes to stay within |
+| `prop_skew_entry` | How aggressively to slow down position accumulation |
+| `prop_skew_exit` | How aggressively to accelerate position unwind |
+
+See `bot_config.example.toml` for a fully annotated reference.
+
+---
 
 ## Architecture
 
-Core modules:
+```
+mm_bot/
+├── main.py               # Entry point, logging, signal handling
+├── bot/bot.py            # Quoting loop, order lifecycle, callbacks
+├── quoter/               # Pluggable quoter system (see below)
+├── config/
+│   ├── config.py         # BotConfig dataclass, TOML + .env loading
+│   └── config_watcher.py # Hot-reload (watches bot_config.toml every 5s)
+├── position/             # Position tracking, persistence
+├── pricing/oracle.py     # Oracle sources (Kuru WS or Coinbase REST)
+└── pnl/tracker.py        # PnL display
+```
 
-- `mm_bot/main.py`: process startup, logging, signal handling
-- `mm_bot/config/config.py`: loads operational config (`bot_config.toml`) and SDK config bundle
-- `mm_bot/bot/bot.py`: quoting loop, order lifecycle callbacks, cancellation/reconciliation, typed recovery
-- `mm_bot/quoter/`: pluggable quoter system (see below)
-- `mm_bot/position/position_tracker.py`: Decimal-native position persistence (`tracking/position_state.json`)
-- `mm_bot/pricing/oracle.py`: oracle sources (`kuru` websocket or `coinbase` REST)
-- `mm_bot/pnl/tracker.py`: Decimal-native PnL display
+The bot tracks all order state from **WebSocket callbacks**, not the REST API. The REST API lags ~2 seconds behind on-chain events and is only used for startup cleanup, orphan detection, and shutdown.
 
 ### Quoter system
 
-The quoter system is pluggable. Each quoter handles one spread level (one bid/ask pair):
+Each quoter manages one bid/ask pair at one spread level. On every iteration the bot:
+
+1. Resolves existing order state from its tracking dicts into a frozen `QuoterContext` snapshot
+2. Calls `quoter.decide(ctx)` — the quoter returns cancels + new orders
+3. Batches everything into a single `place_orders()` transaction
 
 | Module | Role |
 |--------|------|
-| `mm_bot/quoter/base.py` | `BaseQuoter` ABC — implement `decide(ctx) -> QuoterDecision` |
-| `mm_bot/quoter/context.py` | `QuoterContext` (market snapshot) and `QuoterDecision` (cancel/place instructions) |
-| `mm_bot/quoter/skew_quoter.py` | Built-in `SkewQuoter` — position-skew with PropMaintain cancel logic |
-| `mm_bot/quoter/registry.py` | `register_quoter()` / `get_quoter_class()` |
+| `quoter/base.py` | `BaseQuoter` ABC — implement `decide(ctx) -> QuoterDecision` |
+| `quoter/context.py` | `QuoterContext` (frozen snapshot) and `QuoterDecision` |
+| `quoter/skew_quoter.py` | Built-in `SkewQuoter` — position skew + PropMaintain cancel logic |
+| `quoter/registry.py` | `register_quoter()` / `get_quoter_class()` |
 
-The bot resolves order state from its tracking dicts into a `QuoterContext` snapshot and passes it to each quoter's `decide()` method. Quoters return a `QuoterDecision` (cloids to cancel + new orders to place) without touching any bot internals.
-
-#### Writing a custom quoter
+### Writing a custom quoter
 
 ```python
 from decimal import Decimal
@@ -53,7 +134,6 @@ class MyQuoter(BaseQuoter):
 
     def decide(self, ctx: QuoterContext) -> QuoterDecision:
         cancels = []
-        # Cancel existing orders whose price source is known
         if ctx.existing_bid and ctx.existing_bid.source not in ("preregistered", "unknown"):
             cancels.append(ctx.existing_bid.cloid)
         if ctx.existing_ask and ctx.existing_ask.source not in ("preregistered", "unknown"):
@@ -85,7 +165,6 @@ register_quoter("my_quoter", MyQuoter)
 ```
 
 Then in `bot_config.toml`:
-
 ```toml
 [[strategy.quoters]]
 type = "my_quoter"
@@ -93,7 +172,7 @@ baseline_edge_bps = 10.0
 quantity = 500
 ```
 
-`QuoterContext` fields available to `decide()`:
+`QuoterContext` fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -107,81 +186,29 @@ quantity = 500
 | `prop_maintain` | `float` | Cancel threshold factor from config |
 | `price_precision` | `Decimal` | Market price precision |
 
-`ExistingOrder.source` values: `"on_chain"`, `"callback"`, `"preregistered"`, `"unknown"`.
+`ExistingOrder.source`: `"on_chain"` · `"callback"` · `"preregistered"` · `"unknown"`
 
-## Install
-
-```bash
-git clone https://github.com/kuru-labs/mm-example.git
-cd mm-example
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-## Configuration
-
-The bot uses:
-
-1. `bot_config.toml` for strategy/operational settings
-2. `.env` for secrets and SDK runtime settings
-
-### Required `.env`
-
-- `PRIVATE_KEY`
-- `MARKET_ADDRESS` (required unless `strategy.market_address` is set in `bot_config.toml`)
-
-### Common SDK `.env` settings
-
-- `RPC_URL` (default `https://rpc.monad.xyz`)
-- `RPC_WS_URL` (default `wss://rpc.monad.xyz`)
-- `KURU_WS_URL` (default `wss://ws.kuru.io/`)
-- `KURU_API_URL` (default `https://api.kuru.io/`)
-- `KURU_RPC_LOGS_SUBSCRIPTION` (default `monadLogs`)
-- `KURU_GAS_BUFFER_MULTIPLIER` (default from SDK)
-- `KURU_USE_ACCESS_LIST` (`true`/`false`)
-- `KURU_POST_ONLY` (`true`/`false`)
-- `KURU_RPC_WS_MAX_RECONNECT_ATTEMPTS`
-- `KURU_RPC_WS_RECONNECT_DELAY`
-- `KURU_RPC_WS_MAX_RECONNECT_DELAY`
-- `KURU_RECONCILIATION_INTERVAL`
-- `KURU_RECONCILIATION_THRESHOLD`
-
-See `.env.example` and `bot_config.example.toml`.
-
-## Run
-
-```bash
-./run.sh
-```
-
-or:
-
-```bash
-source venv/bin/activate
-PYTHONPATH=. python3 mm_bot/main.py
-```
-
-## Runtime Notes
-
-- Position state is persisted as Decimal-safe values in `tracking/position_state.json`.
-- Terminal order states now include `ORDER_TIMEOUT` and `ORDER_FAILED` handling.
-- SDK typed errors are classified for retry vs skip behavior:
-  - execution errors: `KuruInsufficientFundsError`, `KuruContractError`, `KuruOrderError`
-  - connectivity errors: `KuruConnectionError`, `KuruWebSocketError`, `KuruTimeoutError`
-  - API/auth errors: `KuruAuthorizationError`
+---
 
 ## Troubleshooting
 
-- Orders not placing:
-  - Check margin balances and wallet gas balance
-  - Confirm market address and token decimals from on-chain market config
-- Frequent retries:
-  - Check RPC/WebSocket health
-  - Tune `KURU_RPC_WS_*` and `KURU_RECONCILIATION_*`
-- No reference price:
-  - Verify selected oracle source in `bot_config.toml`
-  - Check connectivity to Kuru WS or Coinbase API
+**Orders not placing**
+- Check margin balances and wallet gas balance
+- Confirm market address and token decimals from on-chain market config
+
+**Frequent retries / connectivity issues**
+- Check RPC/WebSocket health
+- Tune `KURU_RPC_WS_*` reconnect settings in `.env`
+
+**No reference price**
+- Verify `oracle_source` in `bot_config.toml`
+- Check connectivity to Kuru WS or Coinbase API
+
+**Position drift after restart**
+- Position is persisted in `tracking/position_state.json`
+- Use `override_start_position` in `bot_config.toml` to force a specific starting value
+
+---
 
 ## License
 
