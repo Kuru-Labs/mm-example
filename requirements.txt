@@ -11,3 +11,6 @@ kuru-sdk-py>=0.1.10
 
 # Configuration hot-reload
 tomli>=2.0.0; python_version < '3.11'
+
+# InfluxDB metrics (optional)
+influxdb3-python

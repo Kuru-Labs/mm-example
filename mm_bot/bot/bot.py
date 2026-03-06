@@ -23,8 +23,9 @@ from mm_bot.kuru_imports import (
     KuruOrderError,
     KuruTimeoutError,
 )
-from mm_bot.config.config import BotConfig
+from mm_bot.config.config import BotConfig, load_influx_config
 from mm_bot.config.config_watcher import ConfigWatcher
+from mm_bot.monitoring.influx import InfluxWriter, _extract_quoter_id
 from mm_bot.quoter.base import BaseQuoter
 from mm_bot.quoter.context import ExistingOrder, QuoterContext
 from mm_bot.quoter.registry import get_quoter_class
@@ -112,6 +113,17 @@ class Bot:
 
         # Validation counter for periodic API checks
         self._validation_counter: int = 0
+
+        # InfluxDB metrics writer (None until start())
+        self.influx: Optional[InfluxWriter] = None
+
+        # TPS tracking
+        self._tx_count: int = 0
+        self._last_state_write_time: float = time.monotonic()
+
+        # Cumulative edge PnL (quote units captured from spread)
+        self._cumulative_edge_pnl: float = 0.0
+        self._cumulative_edge_pnl_by_quoter: Dict[str, float] = {}
 
         # Initialize components (position tracker will be initialized in start())
         self.position_tracker: Optional[PositionTracker] = None
@@ -262,8 +274,20 @@ class Bot:
                 f"(ID: {order.kuru_order_id}, size: {float(order_size):.8f})"
             )
 
+            if self.influx:
+                side_str = "buy" if order.side == OrderSide.BUY else "sell"
+                self.influx.write_order(
+                    side=side_str,
+                    price=float(order_price),
+                    size=float(order_size),
+                    quoter_id=_extract_quoter_id(order.cloid),
+                    event="placed",
+                )
+
         # Track cancellations
         elif order.status == OrderStatus.ORDER_CANCELLED:
+            # Capture price/size before cleanup clears active_orders
+            cancelled_order = self.active_orders.get(order.cloid)
             self._cleanup_order_tracking(
                 order.cloid,
                 order.kuru_order_id,
@@ -271,6 +295,16 @@ class Bot:
             )
             self._debug_log(f"[INVENTORY] Removed cancelled order: {order.cloid}")
             logger.debug(f"✗ Order {order.cloid} cancelled")
+
+            if self.influx and cancelled_order:
+                side_str = "buy" if cancelled_order.side == OrderSide.BUY else "sell"
+                self.influx.write_order(
+                    side=side_str,
+                    price=float(cancelled_order.price),
+                    size=float(cancelled_order.size),
+                    quoter_id=_extract_quoter_id(order.cloid),
+                    event="cancelled",
+                )
 
         # Track fills and update position
         elif order.status == OrderStatus.ORDER_FULLY_FILLED:
@@ -332,6 +366,37 @@ class Bot:
                 f"Price: {order.price}"
             )
 
+            if self.influx and previous_size is not None and order.side is not None:
+                oracle_price_raw = self.oracle_service.get_price(
+                    self.market_config.market_address, self.oracle_source
+                )
+                if oracle_price_raw is not None:
+                    oracle_f = float(oracle_price_raw)
+                    fill_f = float(order_price)
+                    size_f = float(filled_size)
+                    is_buy = order.side == OrderSide.BUY
+                    realized_edge_bps = (
+                        (oracle_f - fill_f) / oracle_f * 10000 if is_buy
+                        else (fill_f - oracle_f) / oracle_f * 10000
+                    )
+                    edge_pnl = size_f * (oracle_f - fill_f if is_buy else fill_f - oracle_f)
+                    self._cumulative_edge_pnl += edge_pnl
+                    qid = _extract_quoter_id(order.cloid)
+                    self._cumulative_edge_pnl_by_quoter[qid] = (
+                        self._cumulative_edge_pnl_by_quoter.get(qid, 0.0) + edge_pnl
+                    )
+                    self.influx.write_fill(
+                        side="buy" if is_buy else "sell",
+                        price=fill_f,
+                        oracle_price=oracle_f,
+                        realized_edge_bps=realized_edge_bps,
+                        edge_pnl=edge_pnl,
+                        filled_size=size_f,
+                        remaining_size=0.0,
+                        fill_type="full",
+                        quoter_id=_extract_quoter_id(order.cloid),
+                    )
+
         elif order.status == OrderStatus.ORDER_PARTIALLY_FILLED:
             self._debug_log(f"[ORDER] PARTIALLY_FILLED event - cloid: {order.cloid}")
             self._debug_log(f"[ORDER]   side: {order.side.value if order.side else 'None'}")
@@ -391,6 +456,37 @@ class Bot:
 
             # Keep in active_cloids since it's still on the book
             logger.info(f"⚡ Order {order.cloid} partially filled")
+
+            if self.influx and previous_size is not None and order.side is not None:
+                oracle_price_raw = self.oracle_service.get_price(
+                    self.market_config.market_address, self.oracle_source
+                )
+                if oracle_price_raw is not None:
+                    oracle_f = float(oracle_price_raw)
+                    fill_f = float(order_price)
+                    size_f = float(filled_size)
+                    is_buy = order.side == OrderSide.BUY
+                    realized_edge_bps = (
+                        (oracle_f - fill_f) / oracle_f * 10000 if is_buy
+                        else (fill_f - oracle_f) / oracle_f * 10000
+                    )
+                    edge_pnl = size_f * (oracle_f - fill_f if is_buy else fill_f - oracle_f)
+                    self._cumulative_edge_pnl += edge_pnl
+                    qid = _extract_quoter_id(order.cloid)
+                    self._cumulative_edge_pnl_by_quoter[qid] = (
+                        self._cumulative_edge_pnl_by_quoter.get(qid, 0.0) + edge_pnl
+                    )
+                    self.influx.write_fill(
+                        side="buy" if is_buy else "sell",
+                        price=fill_f,
+                        oracle_price=oracle_f,
+                        realized_edge_bps=realized_edge_bps,
+                        edge_pnl=edge_pnl,
+                        filled_size=size_f,
+                        remaining_size=float(order_size),
+                        fill_type="partial",
+                        quoter_id=_extract_quoter_id(order.cloid),
+                    )
         elif order.status == OrderStatus.ORDER_TIMEOUT:
             self._cleanup_order_tracking(order.cloid, order.kuru_order_id)
             logger.warning(
@@ -445,6 +541,26 @@ class Bot:
 
         # Create quoters with calculated quantity
         self._initialize_quoters()
+
+        # Start InfluxDB metrics writer (no-op if INFLUX_URL not set)
+        influx_cfg = load_influx_config()
+        if influx_cfg:
+            self.influx = InfluxWriter(
+                url=influx_cfg["url"],
+                token=influx_cfg["token"],
+                database=influx_cfg["database"],
+                market=self.market_config.market_address,
+                oracle_source=self.oracle_source,
+            )
+            await self.influx.start()
+            self._cumulative_edge_pnl = await self.influx.query_last_cumulative_edge_pnl(
+                self.market_config.market_address
+            )
+            self._cumulative_edge_pnl_by_quoter = await self.influx.query_last_cumulative_edge_pnl_by_quoter(
+                self.market_config.market_address
+            )
+        else:
+            logger.info("InfluxDB metrics disabled (INFLUX_URL not set)")
 
         # Start config watcher (if bot_config.toml exists)
         config_path = Path("bot_config.toml")
@@ -750,6 +866,19 @@ class Bot:
 
             # Periodic API validation (every 10th reconciliation)
             await self._validate_against_api()
+
+            # Write reconcile metrics to InfluxDB
+            if self.influx:
+                self.influx.write_reconcile(
+                    tracked_position=float(tracked_position),
+                    drift=float(drift),
+                    free_base=float(free_base),
+                    locked_base=float(locked_base),
+                    free_quote=float(free_quote),
+                    locked_quote=float(locked_quote),
+                    num_active_orders=len(self.active_orders),
+                    block_number=int(block_number),
+                )
 
             # Show clean summary with drift delta
             drift_status = f"Δ{float(drift_delta):+.2f}" if previous_drift is not None else "baseline"
@@ -1074,6 +1203,7 @@ class Bot:
                             price_rounding="default",
                         )
                         logger.info(f"Transaction hash: {txhash}")
+                        self._tx_count += 1
                     except (
                         KuruInsufficientFundsError,
                         KuruContractError,
@@ -1095,6 +1225,54 @@ class Bot:
                     self.pnl_tracker.print_pnl()
                 else:
                     logger.debug("No order updates needed (quoters kept existing orders)")
+
+                # Write iteration metrics to InfluxDB
+                if self.influx:
+                    current_position = self.position_tracker.get_current_position()
+                    stop_bids = current_position > self.bot_config.max_position
+                    stop_asks = current_position < -self.bot_config.max_position
+
+                    # Compute TPS
+                    now = time.monotonic()
+                    elapsed = now - self._last_state_write_time
+                    tps = self._tx_count / elapsed if elapsed > 0 else 0.0
+                    self._tx_count = 0
+                    self._last_state_write_time = now
+
+                    # Build order price snapshot
+                    order_prices: dict = {}
+                    bids = sorted(
+                        [o for o in self.active_orders.values() if o.side == OrderSide.BUY],
+                        key=lambda o: o.price, reverse=True,
+                    )
+                    asks = sorted(
+                        [o for o in self.active_orders.values() if o.side == OrderSide.SELL],
+                        key=lambda o: o.price,
+                    )
+                    for i, o in enumerate(bids):
+                        order_prices[f"bid_{i}"] = float(o.price)
+                    for i, o in enumerate(asks):
+                        order_prices[f"ask_{i}"] = float(o.price)
+                    best_bid = float(bids[0].price) if bids else None
+                    best_ask = float(asks[0].price) if asks else None
+
+                    pnl_val = self.pnl_tracker.get_pnl()
+                    self.influx.write_state(
+                        reference_price=float(reference_price),
+                        position=float(current_position),
+                        pnl=float(pnl_val) if pnl_val is not None else None,
+                        num_active_orders=len(self.active_cloids),
+                        num_cancels=num_cancels,
+                        num_new_orders=num_new_orders,
+                        stop_bids=stop_bids,
+                        stop_asks=stop_asks,
+                        tps=tps,
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        order_prices=order_prices,
+                        cumulative_edge_pnl=self._cumulative_edge_pnl,
+                        cumulative_edge_pnl_by_quoter=self._cumulative_edge_pnl_by_quoter,
+                    )
 
                 # Sleep 1 second
                 try:
@@ -1573,6 +1751,10 @@ class Bot:
         Stop the bot: cancel all active orders and stop the client.
         """
         logger.info("\n🛑 Stopping bot...")
+
+        # Flush and stop InfluxDB writer before anything else
+        if self.influx:
+            await self.influx.stop()
 
         # Cancel all active orders with exponential backoff
         await self._cancel_all_orders_with_retry()

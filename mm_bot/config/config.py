@@ -34,6 +34,21 @@ class BotConfig:
     quoters_config: Optional[List[dict]] = None  # Per-quoter config for mixed types ([[strategy.quoters]])
 
 
+def load_influx_config() -> Optional[dict]:
+    """
+    Load InfluxDB connection config from environment variables.
+    Returns None if INFLUX_URL is not set (metrics disabled).
+    """
+    url = os.getenv("INFLUX_URL")
+    if not url:
+        return None
+    return {
+        "url": url,
+        "token": os.getenv("INFLUX_TOKEN", ""),
+        "database": os.getenv("INFLUX_DATABASE", "mm_bot"),
+    }
+
+
 def load_secrets_from_env(market_address: Optional[str] = None) -> SDKConfigs:
     """
     Load secrets (wallet, connection, market) from .env file.

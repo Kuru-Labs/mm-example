@@ -4,9 +4,11 @@
 [strategy]
 # --- HOT-RELOADABLE (changes apply immediately) ---
 
-# Cancel threshold factor (0.2 = keep orders with edge >= 80% of target)
+# Cancel threshold factor: keep orders where current_edge >= target_edge * (1 - prop_maintain)
+# 0.02 = replace only when edge drifts below 98% of target (aggressive)
+# 0.50 = replace only when edge drifts below 50% of target (patient)
 # Range: 0.0 to 1.0
-# Higher values = more aggressive replacement, lower values = more patient
+# Lower values = more aggressive replacement, higher values = more patient
 prop_maintain = 0.2
 
 # Seconds between position reconciliation (0 = disabled)
