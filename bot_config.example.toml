@@ -1,104 +1,47 @@
-# Operational Configuration for MM Bot
-# Hot-reload enabled: changes detected every 5 seconds
+# MM Bot — example config. Copy to bot_config.toml and edit.
+# For parameter explanations and tuning advice see TUNING.md.
 
 [strategy]
-# --- HOT-RELOADABLE (changes apply immediately) ---
 
-# Cancel threshold factor: keep orders where current_edge >= target_edge * (1 - prop_maintain)
-# 0.02 = replace only when edge drifts below 98% of target (aggressive)
-# 0.50 = replace only when edge drifts below 50% of target (patient)
-# Range: 0.0 to 1.0
-# Lower values = more aggressive replacement, higher values = more patient
-prop_maintain = 0.2
+prop_maintain = 0.2          # cancel threshold (see TUNING.md)
+reconcile_interval = 30      # seconds between orphan checks
 
-# Seconds between position reconciliation (0 = disabled)
-# Reconciliation validates placed orders via REST API
-# Range: >= 0.0
-reconcile_interval = 300
+max_position = 10000         # max inventory in base token units
+prop_skew_entry = 0.5        # skew aggressiveness when building position
+prop_skew_exit = 0.5         # skew aggressiveness when unwinding position
+quantity = 400               # order size per side per level (base token units)
 
-# --- FULL REINIT REQUIRED (brief trading pause) ---
-
-# Maximum position size (base token units)
-# Bot will skew quotes to avoid exceeding this limit
-# Range: > 0.0
-max_position = 10000
-
-# Skew multiplier when entering position (acquiring inventory)
-# Range: >= 0.0
-# Higher values = more aggressive skewing when taking on position
-prop_skew_entry = 0.5
-
-# Skew multiplier when exiting position (reducing inventory)
-# Range: >= 0.0
-# Higher values = more aggressive skewing when reducing position
-prop_skew_exit = 0.5
-
-# Base order quantity (base token units)
-# Used when quantity_bps_per_level is null
-# Range: > 0.0
-quantity = 400
-
-# Optional: quantity as bps of max_position (overrides quantity if set)
-# Example: 100 = 1% of max_position per level
-# Comment out or omit to use fixed quantity instead
-# quantity_bps_per_level = 2000
-
-# Quoter type for flat config (default: "skew")
-# Built-in types: "skew" (position-skew with PropMaintain)
-# Custom quoters: implement BaseQuoter, then register_quoter("my_type", MyQuoter)
 quoter_type = "skew"
+quoters_bps = [5, 15]        # baseline edge levels in bps — one bid/ask pair each
 
-# Quoter levels in basis points from mid
-# Each value creates a bid/ask pair at that spread using the quoter_type above
-# Example: [1, 10, 15] creates quotes at 1bps, 10bps, and 15bps from mid
-# Range: non-empty list of positive numbers
-quoters_bps = [1, 10, 15]
+# Market address — find yours at:
+# https://github.com/Kuru-Labs/kuru-exchange-server/blob/master/config/markets.toml
+market_address = "0x..."
 
-# --- RESTART REQUIRED (cannot hot-reload) ---
+# Oracle: "kuru" (recommended) or "coinbase"
+oracle_source = "kuru"
+kuru_symbol = "mon_ausd"     # symbol from markets.toml above
+kuru_depth_state = "proposed" # proposed | voted | finalized | committed (see TUNING.md)
 
-# Market address (Kuru DEX market contract)
-# Comment out or omit to use MARKET_ADDRESS from .env
-# Changing requires restart to apply
-market_address = "0x065c9d28e428a0db40191a54d33d5b7c71a9c394"
+# oracle_source = "coinbase"
+# coinbase_symbol = "MON-USD"
 
-# Price oracle source: "kuru" (orderbook mid) or "coinbase" (Coinbase API)
-# Changing requires connection restart
-oracle_source = "coinbase"
-
-# Coinbase symbol (required when oracle_source = "coinbase")
-# Example: "MON-USD", "BTC-USD"
-# Changing requires connection restart
-coinbase_symbol = "MON-USD"
-
-# Manual position override (only used at initial startup)
-# Comment out or omit to start from saved position state
-# Changing requires restart to apply
-# override_start_position = 1000.0
+# override_start_position = 0.0   # force a starting position on restart
 
 
-# --- ALTERNATIVE: Per-quoter config (mixed types) ---
-# Use [[strategy.quoters]] instead of quoters_bps to configure each quoter
-# independently — including mixing different quoter types.
-# When this section is present, quoters_bps and quoter_type above are ignored.
-#
-# Each entry requires at minimum: type, baseline_edge_bps, quantity
-# Type-specific params (e.g. prop_skew_entry) are passed to the quoter's from_config()
+# --- Per-quoter config (optional, overrides quoters_bps above) ---
+# Use [[strategy.quoters]] for independent params per level or mixed quoter types.
 #
 # [[strategy.quoters]]
 # type = "skew"
-# baseline_edge_bps = 1.0
+# baseline_edge_bps = 5.0
+# quantity = 500
+# prop_skew_entry = 0.3
+# prop_skew_exit = 0.7
+#
+# [[strategy.quoters]]
+# type = "skew"
+# baseline_edge_bps = 20.0
 # quantity = 1000
 # prop_skew_entry = 0.5
-# prop_skew_exit = 0.5
-#
-# [[strategy.quoters]]
-# type = "skew"
-# baseline_edge_bps = 15.0
-# quantity = 500
-# prop_skew_entry = 0.8    # tighter entry skew at wide level
-# prop_skew_exit = 0.3     # more patient exit skew at wide level
-#
-# [[strategy.quoters]]
-# type = "my_custom_quoter"   # registered via register_quoter()
-# my_param = "value"
-# quantity = 200
+# prop_skew_exit = 0.3

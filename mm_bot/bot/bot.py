@@ -133,15 +133,13 @@ class Bot:
         self.oracle_source = bot_config.oracle_source  # "kuru" or "coinbase"
 
         # Set up the configured price source
+        self.kuru_price_source = None
         if self.oracle_source == "kuru":
-            # Kuru WebSocket price source (will be started in start() method)
-            self.kuru_price_source = KuruPriceSource()
+            self.kuru_price_source = KuruPriceSource(depth_state=bot_config.kuru_depth_state)
             self.oracle_service.add_price_source("kuru", self.kuru_price_source)
         else:
-            # Coinbase API price source (default)
             self.coinbase_price_source = CoinbasePriceSource(symbol=self.bot_config.coinbase_symbol)
             self.oracle_service.add_price_source("coinbase", self.coinbase_price_source)
-            self.kuru_price_source = None  # Not used
 
         # PnL tracker (will be initialized after position tracker in start())
         self.pnl_tracker: Optional[PnlTracker] = None
@@ -521,9 +519,9 @@ class Bot:
         # Start price feed based on configured oracle
         if self.oracle_source == "kuru":
             logger.info("Connecting to Kuru orderbook WebSocket...")
-            self.kuru_price_source.start(self.market_config.market_address)
+            self.kuru_price_source.start(self.bot_config.kuru_symbol)
         else:
-            logger.info(f"Using Coinbase API as oracle (symbol: MON-USD)")
+            logger.info(f"Using Coinbase API as oracle (symbol: {self.bot_config.coinbase_symbol})")
 
         # ONE-TIME cleanup: Cancel any leftover orders from previous runs
         await self._cancel_all_existing_orders()

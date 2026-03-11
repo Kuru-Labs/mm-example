@@ -21,14 +21,25 @@ Set your credentials in `.env`:
 PRIVATE_KEY=your_private_key_without_0x
 ```
 
-Set your market in `bot_config.toml`:
+Set your market and oracle in `bot_config.toml`. Available market symbols and their `market_address` values are listed in [kuru-exchange-server/config/markets.toml](https://github.com/Kuru-Labs/kuru-exchange-server/blob/master/config/markets.toml):
 ```toml
-market_address = "0x..."
-oracle_source = "kuru"   # or "coinbase" (requires coinbase_symbol)
+market_address = "0x..."   # orderbookAddress from markets.toml
+oracle_source = "kuru"
+kuru_symbol = "mon_ausd"   # symbol from markets.toml
 ```
 
+**Deposit tokens into your margin account** before running. The bot places orders from your Kuru margin balance — a zero balance means no orders will go through:
 ```bash
-PYTHONPATH=. python3 -m mm_bot.main
+# Check your current margin balance
+python deposit.py --token 0x... --check
+
+# Deposit tokens (use the token address for your market's base or quote token)
+python deposit.py --token 0x... --amount 100
+```
+
+Then start the bot:
+```bash
+python -m mm_bot.main
 ```
 
 Logs appear under `tracking/`.
@@ -62,6 +73,27 @@ The bot uses two config files:
 | `KURU_USE_ACCESS_LIST` | `true`/`false` |
 | `KURU_POST_ONLY` | `true`/`false` |
 
+### Oracle: Kuru exchange server
+
+When `oracle_source = "kuru"`, the bot connects to `wss://exchange.kuru.io` and subscribes to live orderbook updates for the given symbol, computing a mid-price from the best bid/ask.
+
+```toml
+oracle_source = "kuru"
+kuru_symbol = "mon_ausd"
+
+# Which Monad block state to read prices from (default: "committed")
+# proposed  → freshest prices, can revert on reorg
+# voted     → validators voted
+# finalized → finalized by validators
+# committed → highest finality, slightly lagging
+kuru_depth_state = "proposed"
+```
+
+Available market symbols are defined in the Kuru exchange server config:
+[kuru-exchange-server/config/markets.toml](https://github.com/Kuru-Labs/kuru-exchange-server/blob/master/config/markets.toml)
+
+---
+
 ### Key `bot_config.toml` parameters
 
 Hot-reloadable (no restart needed):
@@ -82,7 +114,7 @@ Full reinit on change (brief trading pause):
 | `prop_skew_entry` | How aggressively to slow down position accumulation |
 | `prop_skew_exit` | How aggressively to accelerate position unwind |
 
-See `bot_config.example.toml` for a fully annotated reference.
+See `bot_config.example.toml` for a fully annotated reference, and **[TUNING.md](TUNING.md)** for a detailed guide on how to tune each parameter.
 
 ---
 
@@ -97,7 +129,7 @@ mm_bot/
 │   ├── config.py         # BotConfig dataclass, TOML + .env loading
 │   └── config_watcher.py # Hot-reload (watches bot_config.toml every 5s)
 ├── position/             # Position tracking, persistence
-├── pricing/oracle.py     # Oracle sources (Kuru WS or Coinbase REST)
+├── pricing/oracle.py     # Oracle sources (Kuru exchange server WS or Coinbase REST)
 └── pnl/tracker.py        # PnL display
 ```
 

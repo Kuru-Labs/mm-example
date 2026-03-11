@@ -235,6 +235,11 @@ class ConfigWatcher:
                 if "coinbase_symbol" not in strategy or not strategy["coinbase_symbol"]:
                     errors.append("coinbase_symbol required when oracle_source='coinbase'")
 
+            # Kuru symbol required when using kuru oracle
+            if strategy.get("oracle_source") == "kuru":
+                if "kuru_symbol" not in strategy or not strategy["kuru_symbol"]:
+                    errors.append("kuru_symbol required when oracle_source='kuru' (e.g. 'mon_ausd')")
+
             # Report all validation errors
             if errors:
                 for error in errors:

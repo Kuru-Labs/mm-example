@@ -27,8 +27,10 @@ class BotConfig:
     quantity_bps_per_level: Optional[float] = None  # If set, overrides quantity
     override_start_position: Optional[float] = None  # Manual position override
     reconcile_interval: float = 300  # Seconds between reconciliation (0=disabled)
-    oracle_source: str = "coinbase"  # "kuru" for Kuru orderbook mid, "coinbase" for Coinbase API
+    oracle_source: str = "coinbase"  # "kuru" | "coinbase"
     coinbase_symbol: Optional[str] = None  # Required when oracle_source="coinbase"
+    kuru_symbol: Optional[str] = None  # Required when oracle_source="kuru" (e.g. "mon_ausd")
+    kuru_depth_state: str = "committed"  # "proposed"|"voted"|"finalized"|"committed"
     market_address: Optional[str] = None  # Market address (restart required to change)
     quoter_type: str = "skew"  # Default quoter type for flat config (used with quoters_bps)
     quoters_config: Optional[List[dict]] = None  # Per-quoter config for mixed types ([[strategy.quoters]])
@@ -137,6 +139,14 @@ def load_operational_config(toml_path: Path) -> BotConfig:
         if "coinbase_symbol" not in strategy or not strategy["coinbase_symbol"]:
             raise ValueError("coinbase_symbol required when oracle_source='coinbase'")
 
+    if strategy["oracle_source"] == "kuru":
+        if "kuru_symbol" not in strategy or not strategy["kuru_symbol"]:
+            raise ValueError("kuru_symbol required when oracle_source='kuru' (e.g. 'mon_ausd')")
+        depth_state = strategy.get("kuru_depth_state", "committed")
+        valid_states = ("proposed", "voted", "finalized", "committed")
+        if depth_state not in valid_states:
+            raise ValueError(f"kuru_depth_state must be one of {valid_states}, got '{depth_state}'")
+
     # Build BotConfig
     return BotConfig(
         prop_maintain=float(strategy["prop_maintain"]),
@@ -153,6 +163,8 @@ def load_operational_config(toml_path: Path) -> BotConfig:
         quoters_bps=[float(x) for x in strategy["quoters_bps"]] if "quoters_bps" in strategy else [],
         oracle_source=strategy["oracle_source"],
         coinbase_symbol=strategy.get("coinbase_symbol"),
+        kuru_symbol=strategy.get("kuru_symbol"),
+        kuru_depth_state=strategy.get("kuru_depth_state", "committed"),
         market_address=strategy.get("market_address"),
         override_start_position=(
             float(strategy["override_start_position"])
