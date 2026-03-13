@@ -52,33 +52,58 @@ Key tracking dicts on `Bot` (all set/cleared together in callbacks):
 
 **Invariant:** A cloid in `active_cloids` always has a matching entry in both `active_orders` and `order_sizes`. These three are always set and cleared together.
 
-### PropMaintain logic (`_generate_orders_with_prop_maintain`)
+### Pluggable quoter system
 
-For each quoter level, each side independently checks whether the existing order's edge is above the cancel threshold (`baseline_edge × (1 - PROP_MAINTAIN)`). The check chain:
+The quoter layer is split into:
 
-1. Order found in REST API result → use API price for edge check
-2. Order in `preregistered_orders` → just sent, awaiting confirmation → hold
-3. Order in `active_orders` → confirmed via callback but REST API hasn't indexed it yet → use callback price for full edge check (logs `[callback]`)
-4. Order in `active_cloids` but not `active_orders` → unknown state → hold
+- `mm_bot/quoter/base.py` — `BaseQuoter` ABC. Implement `decide(ctx: QuoterContext) -> QuoterDecision`.
+- `mm_bot/quoter/context.py` — `QuoterContext` (frozen snapshot of market state) and `QuoterDecision` (cancels + new orders).
+- `mm_bot/quoter/skew_quoter.py` — `SkewQuoter`, the built-in strategy (position-skew + PropMaintain).
+- `mm_bot/quoter/registry.py` — `register_quoter(name, cls)` / `get_quoter_class(name)`.
+- `mm_bot/quoter/quoter.py` — backward-compat shim (`SkewQuoter as Quoter`).
 
-**Coupling:** when one side of a quoter is replaced, the other is force-replaced too (lines ~1090–1100 in `bot.py`). This keeps both sides priced off the same reference.
+The bot creates quoters via `_initialize_quoters()` using the registry. For each iteration it:
+1. Calls `_resolve_existing_orders(quoter, on_chain_by_cloid)` to build `ExistingOrder` objects from tracking dicts
+2. Constructs a `QuoterContext` snapshot
+3. Calls `quoter.decide(ctx)` to get cancels + new orders
+4. Processes the `QuoterDecision` (discard cancelled cloids from `active_cloids`, batch into `place_orders()`)
+
+This replaces the old `_generate_orders_with_prop_maintain` method. All per-quoter strategy logic now lives in the quoter's `decide()` method.
+
+### Order generation flow (`_generate_orders`)
+
+For each quoter, `_resolve_existing_orders` resolves the existing bid/ask from tracking dicts using this priority:
+
+1. Found in `on_chain_by_cloid` (REST API) → source `"on_chain"`, price from API
+2. Found in `preregistered_orders` → source `"preregistered"`, price `None`
+3. Found in `active_orders` → source `"callback"`, price from callback
+4. Found in `active_cloids` only → source `"unknown"`, price `None`
+
+The `SkewQuoter.decide()` check chain:
+1. source `"preregistered"` → hold (awaiting confirmation)
+2. source `"unknown"` → hold
+3. source `"on_chain"` or `"callback"` → edge check against cancel threshold; keep or cancel
+4. Coupling: if one side replaced, force-replace the other (uses same reference price/skew)
 
 ### Cloid format
 
 ```
-{side}-{baseline_edge_bps}-{timestamp_ms}
+{side}-{quoter_id}-{timestamp_ms}
 # e.g. bid-1.0-1771500973306, ask-15.0-1771500975944
 ```
 
-Quoter-to-order matching uses cloid prefix (`bid-{bps}-` / `ask-{bps}-`). Do not change this format without updating the matching logic.
+For `SkewQuoter`, `quoter_id = str(Decimal(str(baseline_edge_bps)))`, preserving the original format.
+For custom quoters, `quoter_id` is set in `BaseQuoter.__init__` and must be unique and stable across restarts.
+
+Quoter-to-order matching uses `cloid_prefix_bid` / `cloid_prefix_ask` properties on `BaseQuoter`. Do not change the format without updating matching logic.
 
 ### Quoter skew formula
 
-`Quoter.get_bid_ask_edges()` adjusts edges based on `position / max_position` (capped ±1):
+`SkewQuoter._get_skewed_edges()` adjusts edges based on `position / max_position` (capped ±1):
 - Long position → widen bids (slow to buy more), tighten asks (eager to sell)
 - Short position → tighten bids (eager to buy), widen asks (slow to sell more)
 
-Skew magnitude is controlled by `PROP_SKEW_ENTRY` and `PROP_SKEW_EXIT`.
+Skew magnitude is controlled by `prop_skew_entry` and `prop_skew_exit`.
 
 ### Shutdown
 
