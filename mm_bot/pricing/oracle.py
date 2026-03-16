@@ -56,31 +56,47 @@ class CoinbasePriceSource(PriceSource):
             return None
 
 
+# Monad block lifecycle states, from freshest to most final.
+# "proposed"  — newest prices, can revert on reorg
+# "voted"     — validators voted
+# "finalized" — finalized by validators
+# "committed" — committed to chain, highest finality (slightly lagging)
+KURU_DEPTH_STATES = ("proposed", "voted", "finalized", "committed")
+
+
 class KuruPriceSource(PriceSource):
     """
     Fetch real-time price from Kuru WebSocket orderbook.
 
-    Maintains a WebSocket connection to wss://ws.kuru.io and subscribes to
-    the frontendOrderbook channel. Calculates mid-price from best bid/ask.
+    Maintains a WebSocket connection to wss://exchange.kuru.io and subscribes to
+    the <symbol>@monadDepth channel. Calculates mid-price from best bid/ask.
+
+    Args:
+        depth_state: Which Monad block state to read prices from.
+            One of "proposed", "voted", "finalized", "committed".
+            Defaults to "committed" (safest). Use "proposed" for freshest prices.
     """
 
-    def __init__(self):
+    def __init__(self, depth_state: str = "committed"):
+        if depth_state not in KURU_DEPTH_STATES:
+            raise ValueError(f"depth_state must be one of {KURU_DEPTH_STATES}, got '{depth_state}'")
+        self._depth_state = depth_state
         self._best_bid: Optional[float] = None
         self._best_ask: Optional[float] = None
-        self._market_id: Optional[str] = None
+        self._symbol: Optional[str] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ready_event = threading.Event()
 
-    def start(self, market_id: str) -> None:
+    def start(self, symbol: str) -> None:
         """
         Start WebSocket connection in background.
 
         Args:
-            market_id: Market address to subscribe to
+            symbol: Market symbol to subscribe to (e.g. "mon_ausd")
         """
-        self._market_id = market_id
+        self._symbol = symbol
 
         # Start WebSocket in background thread with its own event loop
         def run_ws():
@@ -99,19 +115,18 @@ class KuruPriceSource(PriceSource):
 
     async def _run_websocket(self) -> None:
         """Run WebSocket connection (internal)"""
-        uri = "wss://ws.kuru.io"
+        uri = "wss://exchange.kuru.io"
 
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(uri) as websocket:
-                    # Subscribe to orderbook
                     subscribe_msg = {
-                        "type": "subscribe",
-                        "channel": "frontendOrderbook",
-                        "market": self._market_id
+                        "method": "SUBSCRIBE",
+                        "params": [f"{self._symbol}@monadDepth"],
+                        "id": 1
                     }
                     await websocket.send(json.dumps(subscribe_msg))
-                    logger.debug(f"Subscribed to Kuru orderbook for {self._market_id}")
+                    logger.debug(f"Subscribed to Kuru orderbook for {self._symbol}@monadDepth")
 
                     # Process messages
                     while not self._stop_event.is_set():
@@ -130,29 +145,41 @@ class KuruPriceSource(PriceSource):
                     await asyncio.sleep(5)  # Retry after 5s
 
     def _process_message(self, data: dict) -> None:
-        """Process WebSocket message and update prices"""
+        """Process WebSocket message and update prices.
+
+        Message format from exchange.kuru.io @monadDepth:
+          {"e": "monadDepthUpdate", "s": "<address>", "states": {"committed": {"b": [["price_wei", "size"], ...], "a": [...]}, "proposed": {...}}}
+        Prices are 10^18-scaled integer strings.
+        """
         try:
-            # Check for orderbook data
-            if "b" in data and "a" in data:
-                bids = data["b"]
-                asks = data["a"]
+            if data.get("e") != "monadDepthUpdate":
+                return
 
-                if bids and asks:
-                    # Best bid/ask are first entries
-                    best_bid_raw = bids[0][0]  # [price, size]
-                    best_ask_raw = asks[0][0]
+            states = data.get("states", {})
+            state = states.get(self._depth_state)
+            if not state:
+                return
 
-                    # Convert from 10^18 to actual price
-                    self._best_bid = best_bid_raw / (10 ** 18)
-                    self._best_ask = best_ask_raw / (10 ** 18)
+            bids = state.get("b")
+            asks = state.get("a")
+            if not bids or not asks:
+                return
 
-                    # Signal ready on first valid data
-                    if not self._ready_event.is_set():
-                        self._ready_event.set()
+            best_bid = int(bids[0][0]) / (10 ** 18)
+            best_ask = int(asks[0][0]) / (10 ** 18)
 
-                    logger.debug(f"Kuru orderbook updated: bid={self._best_bid:.6f}, ask={self._best_ask:.6f}")
+            if best_bid <= 0 or best_ask <= 0:
+                return
 
-        except (KeyError, IndexError, TypeError) as e:
+            self._best_bid = best_bid
+            self._best_ask = best_ask
+
+            if not self._ready_event.is_set():
+                self._ready_event.set()
+
+            logger.debug(f"Kuru orderbook updated: bid={self._best_bid:.6f}, ask={self._best_ask:.6f}")
+
+        except (KeyError, IndexError, TypeError, ValueError) as e:
             logger.warning(f"Failed to parse Kuru orderbook: {e}")
 
     def get_price(self, market_id: str) -> Optional[float]:

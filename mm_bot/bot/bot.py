@@ -23,9 +23,12 @@ from mm_bot.kuru_imports import (
     KuruOrderError,
     KuruTimeoutError,
 )
-from mm_bot.config.config import BotConfig
+from mm_bot.config.config import BotConfig, load_influx_config
 from mm_bot.config.config_watcher import ConfigWatcher
-from mm_bot.quoter.quoter import Quoter
+from mm_bot.monitoring.influx import InfluxWriter, _extract_quoter_id
+from mm_bot.quoter.base import BaseQuoter
+from mm_bot.quoter.context import ExistingOrder, QuoterContext
+from mm_bot.quoter.registry import get_quoter_class
 from mm_bot.position.position_tracker import PositionTracker
 from mm_bot.pricing.oracle import OracleService, KuruPriceSource, CoinbasePriceSource
 from mm_bot.pnl.tracker import PnlTracker
@@ -111,6 +114,17 @@ class Bot:
         # Validation counter for periodic API checks
         self._validation_counter: int = 0
 
+        # InfluxDB metrics writer (None until start())
+        self.influx: Optional[InfluxWriter] = None
+
+        # TPS tracking
+        self._tx_count: int = 0
+        self._last_state_write_time: float = time.monotonic()
+
+        # Cumulative edge PnL (quote units captured from spread)
+        self._cumulative_edge_pnl: float = 0.0
+        self._cumulative_edge_pnl_by_quoter: Dict[str, float] = {}
+
         # Initialize components (position tracker will be initialized in start())
         self.position_tracker: Optional[PositionTracker] = None
 
@@ -119,21 +133,19 @@ class Bot:
         self.oracle_source = bot_config.oracle_source  # "kuru" or "coinbase"
 
         # Set up the configured price source
+        self.kuru_price_source = None
         if self.oracle_source == "kuru":
-            # Kuru WebSocket price source (will be started in start() method)
-            self.kuru_price_source = KuruPriceSource()
+            self.kuru_price_source = KuruPriceSource(depth_state=bot_config.kuru_depth_state)
             self.oracle_service.add_price_source("kuru", self.kuru_price_source)
         else:
-            # Coinbase API price source (default)
             self.coinbase_price_source = CoinbasePriceSource(symbol=self.bot_config.coinbase_symbol)
             self.oracle_service.add_price_source("coinbase", self.coinbase_price_source)
-            self.kuru_price_source = None  # Not used
 
         # PnL tracker (will be initialized after position tracker in start())
         self.pnl_tracker: Optional[PnlTracker] = None
 
         # Quoters will be created after position tracker is initialized
-        self.quoters: List[Quoter] = []
+        self.quoters: List[BaseQuoter] = []
 
         # Config watcher for hot-reload
         self.config_watcher: Optional[ConfigWatcher] = None
@@ -260,8 +272,20 @@ class Bot:
                 f"(ID: {order.kuru_order_id}, size: {float(order_size):.8f})"
             )
 
+            if self.influx:
+                side_str = "buy" if order.side == OrderSide.BUY else "sell"
+                self.influx.write_order(
+                    side=side_str,
+                    price=float(order_price),
+                    size=float(order_size),
+                    quoter_id=_extract_quoter_id(order.cloid),
+                    event="placed",
+                )
+
         # Track cancellations
         elif order.status == OrderStatus.ORDER_CANCELLED:
+            # Capture price/size before cleanup clears active_orders
+            cancelled_order = self.active_orders.get(order.cloid)
             self._cleanup_order_tracking(
                 order.cloid,
                 order.kuru_order_id,
@@ -269,6 +293,16 @@ class Bot:
             )
             self._debug_log(f"[INVENTORY] Removed cancelled order: {order.cloid}")
             logger.debug(f"✗ Order {order.cloid} cancelled")
+
+            if self.influx and cancelled_order:
+                side_str = "buy" if cancelled_order.side == OrderSide.BUY else "sell"
+                self.influx.write_order(
+                    side=side_str,
+                    price=float(cancelled_order.price),
+                    size=float(cancelled_order.size),
+                    quoter_id=_extract_quoter_id(order.cloid),
+                    event="cancelled",
+                )
 
         # Track fills and update position
         elif order.status == OrderStatus.ORDER_FULLY_FILLED:
@@ -330,6 +364,37 @@ class Bot:
                 f"Price: {order.price}"
             )
 
+            if self.influx and previous_size is not None and order.side is not None:
+                oracle_price_raw = self.oracle_service.get_price(
+                    self.market_config.market_address, self.oracle_source
+                )
+                if oracle_price_raw is not None:
+                    oracle_f = float(oracle_price_raw)
+                    fill_f = float(order_price)
+                    size_f = float(filled_size)
+                    is_buy = order.side == OrderSide.BUY
+                    realized_edge_bps = (
+                        (oracle_f - fill_f) / oracle_f * 10000 if is_buy
+                        else (fill_f - oracle_f) / oracle_f * 10000
+                    )
+                    edge_pnl = size_f * (oracle_f - fill_f if is_buy else fill_f - oracle_f)
+                    self._cumulative_edge_pnl += edge_pnl
+                    qid = _extract_quoter_id(order.cloid)
+                    self._cumulative_edge_pnl_by_quoter[qid] = (
+                        self._cumulative_edge_pnl_by_quoter.get(qid, 0.0) + edge_pnl
+                    )
+                    self.influx.write_fill(
+                        side="buy" if is_buy else "sell",
+                        price=fill_f,
+                        oracle_price=oracle_f,
+                        realized_edge_bps=realized_edge_bps,
+                        edge_pnl=edge_pnl,
+                        filled_size=size_f,
+                        remaining_size=0.0,
+                        fill_type="full",
+                        quoter_id=_extract_quoter_id(order.cloid),
+                    )
+
         elif order.status == OrderStatus.ORDER_PARTIALLY_FILLED:
             self._debug_log(f"[ORDER] PARTIALLY_FILLED event - cloid: {order.cloid}")
             self._debug_log(f"[ORDER]   side: {order.side.value if order.side else 'None'}")
@@ -389,6 +454,37 @@ class Bot:
 
             # Keep in active_cloids since it's still on the book
             logger.info(f"⚡ Order {order.cloid} partially filled")
+
+            if self.influx and previous_size is not None and order.side is not None:
+                oracle_price_raw = self.oracle_service.get_price(
+                    self.market_config.market_address, self.oracle_source
+                )
+                if oracle_price_raw is not None:
+                    oracle_f = float(oracle_price_raw)
+                    fill_f = float(order_price)
+                    size_f = float(filled_size)
+                    is_buy = order.side == OrderSide.BUY
+                    realized_edge_bps = (
+                        (oracle_f - fill_f) / oracle_f * 10000 if is_buy
+                        else (fill_f - oracle_f) / oracle_f * 10000
+                    )
+                    edge_pnl = size_f * (oracle_f - fill_f if is_buy else fill_f - oracle_f)
+                    self._cumulative_edge_pnl += edge_pnl
+                    qid = _extract_quoter_id(order.cloid)
+                    self._cumulative_edge_pnl_by_quoter[qid] = (
+                        self._cumulative_edge_pnl_by_quoter.get(qid, 0.0) + edge_pnl
+                    )
+                    self.influx.write_fill(
+                        side="buy" if is_buy else "sell",
+                        price=fill_f,
+                        oracle_price=oracle_f,
+                        realized_edge_bps=realized_edge_bps,
+                        edge_pnl=edge_pnl,
+                        filled_size=size_f,
+                        remaining_size=float(order_size),
+                        fill_type="partial",
+                        quoter_id=_extract_quoter_id(order.cloid),
+                    )
         elif order.status == OrderStatus.ORDER_TIMEOUT:
             self._cleanup_order_tracking(order.cloid, order.kuru_order_id)
             logger.warning(
@@ -423,9 +519,9 @@ class Bot:
         # Start price feed based on configured oracle
         if self.oracle_source == "kuru":
             logger.info("Connecting to Kuru orderbook WebSocket...")
-            self.kuru_price_source.start(self.market_config.market_address)
+            self.kuru_price_source.start(self.bot_config.kuru_symbol)
         else:
-            logger.info(f"Using Coinbase API as oracle (symbol: MON-USD)")
+            logger.info(f"Using Coinbase API as oracle (symbol: {self.bot_config.coinbase_symbol})")
 
         # ONE-TIME cleanup: Cancel any leftover orders from previous runs
         await self._cancel_all_existing_orders()
@@ -443,6 +539,26 @@ class Bot:
 
         # Create quoters with calculated quantity
         self._initialize_quoters()
+
+        # Start InfluxDB metrics writer (no-op if INFLUX_URL not set)
+        influx_cfg = load_influx_config()
+        if influx_cfg:
+            self.influx = InfluxWriter(
+                url=influx_cfg["url"],
+                token=influx_cfg["token"],
+                database=influx_cfg["database"],
+                market=self.market_config.market_address,
+                oracle_source=self.oracle_source,
+            )
+            await self.influx.start()
+            self._cumulative_edge_pnl = await self.influx.query_last_cumulative_edge_pnl(
+                self.market_config.market_address
+            )
+            self._cumulative_edge_pnl_by_quoter = await self.influx.query_last_cumulative_edge_pnl_by_quoter(
+                self.market_config.market_address
+            )
+        else:
+            logger.info("InfluxDB metrics disabled (INFLUX_URL not set)")
 
         # Start config watcher (if bot_config.toml exists)
         config_path = Path("bot_config.toml")
@@ -517,36 +633,54 @@ class Bot:
 
     def _initialize_quoters(self) -> None:
         """
-        Initialize quoters with calculated quantity based on config.
-        Uses quantity_bps_per_level if set, otherwise uses fixed quantity.
-        """
-        for baseline_edge_bps in self.bot_config.quoters_bps:
-            # Calculate quantity
-            if self.bot_config.quantity_bps_per_level is not None:
-                # Use BPS of max position
-                quantity = (self.bot_config.max_position * self.bot_config.quantity_bps_per_level) / 10000
-                logger.info(
-                    f"Quoter {baseline_edge_bps}bps: Using quantity_bps={self.bot_config.quantity_bps_per_level} "
-                    f"→ quantity={quantity:.2f}"
-                )
-            else:
-                # Use fixed quantity
-                quantity = self.bot_config.quantity
-                logger.info(f"Quoter {baseline_edge_bps}bps: Using fixed quantity={quantity}")
+        Initialize quoters from config.
 
-            quoter = Quoter(
-                oracle_service=self.oracle_service,
-                position_tracker=self.position_tracker,
-                source_name="kuru",
-                market_id=self.market_config.market_address,
-                baseline_edge_bps=baseline_edge_bps,
-                max_position=self.bot_config.max_position,
-                prop_skew_entry=self.bot_config.prop_skew_entry,
-                prop_skew_exit=self.bot_config.prop_skew_exit,
-                quantity=quantity,
-                market_config=self.market_config
-            )
-            self.quoters.append(quoter)
+        Supports two config formats:
+        1. Flat: quoters_bps list + shared params (backward-compatible)
+        2. Per-quoter: [[strategy.quoters]] with type + per-quoter params (mixed types)
+        """
+        # Ensure registry is populated (importing __init__ triggers registration)
+        import mm_bot.quoter  # noqa: F401
+
+        if self.bot_config.quoters_config:
+            # Per-quoter config: [[strategy.quoters]]
+            for i, q_conf in enumerate(self.bot_config.quoters_config):
+                quoter_type = q_conf["type"]
+                quoter_cls = get_quoter_class(quoter_type)
+
+                # Allow quoter-level quantity override, fall back to strategy-level
+                if "quantity" not in q_conf and self.bot_config.quantity:
+                    q_conf = {**q_conf, "quantity": self.bot_config.quantity}
+
+                quoter = quoter_cls.from_config(q_conf)
+                self.quoters.append(quoter)
+                logger.info(f"Quoter [{i}] type={quoter_type} id={quoter.quoter_id} quantity={float(quoter.quantity)}")
+        else:
+            # Flat config: quoters_bps + shared skew params (backward-compatible)
+            quoter_type = self.bot_config.quoter_type
+            quoter_cls = get_quoter_class(quoter_type)
+
+            for baseline_edge_bps in self.bot_config.quoters_bps:
+                # Calculate quantity
+                if self.bot_config.quantity_bps_per_level is not None:
+                    quantity = (self.bot_config.max_position * self.bot_config.quantity_bps_per_level) / 10000
+                    logger.info(
+                        f"Quoter {baseline_edge_bps}bps: Using quantity_bps={self.bot_config.quantity_bps_per_level} "
+                        f"→ quantity={quantity:.2f}"
+                    )
+                else:
+                    quantity = self.bot_config.quantity
+                    logger.info(f"Quoter {baseline_edge_bps}bps: Using fixed quantity={quantity}")
+
+                # Build config section for from_config
+                q_conf = {
+                    "baseline_edge_bps": baseline_edge_bps,
+                    "quantity": quantity,
+                    "prop_skew_entry": self.bot_config.prop_skew_entry,
+                    "prop_skew_exit": self.bot_config.prop_skew_exit,
+                }
+                quoter = quoter_cls.from_config(q_conf)
+                self.quoters.append(quoter)
 
         logger.success(f"✓ Initialized {len(self.quoters)} quoters")
 
@@ -730,6 +864,19 @@ class Bot:
 
             # Periodic API validation (every 10th reconciliation)
             await self._validate_against_api()
+
+            # Write reconcile metrics to InfluxDB
+            if self.influx:
+                self.influx.write_reconcile(
+                    tracked_position=float(tracked_position),
+                    drift=float(drift),
+                    free_base=float(free_base),
+                    locked_base=float(locked_base),
+                    free_quote=float(free_quote),
+                    locked_quote=float(locked_quote),
+                    num_active_orders=len(self.active_orders),
+                    block_number=int(block_number),
+                )
 
             # Show clean summary with drift delta
             drift_status = f"Δ{float(drift_delta):+.2f}" if previous_drift is not None else "baseline"
@@ -1014,12 +1161,12 @@ class Bot:
                 # Get current on-chain active orders
                 on_chain_orders = self.client.user.get_active_orders()
 
-                # Use PropMaintain logic to generate orders (only cancels orders below cancel threshold)
-                all_orders, num_cancels, num_new_orders = self._generate_orders_with_prop_maintain(
+                # Delegate to quoters to decide what to cancel and place
+                all_orders, num_cancels, num_new_orders = self._generate_orders(
                     reference_price, on_chain_orders
                 )
 
-                logger.info(f"PropMaintain: {num_cancels} cancels, {num_new_orders} new orders")
+                logger.info(f"Quoters: {num_cancels} cancels, {num_new_orders} new orders")
 
                 # Validate balance before placing orders
                 if all_orders:
@@ -1054,6 +1201,7 @@ class Bot:
                             price_rounding="default",
                         )
                         logger.info(f"Transaction hash: {txhash}")
+                        self._tx_count += 1
                     except (
                         KuruInsufficientFundsError,
                         KuruContractError,
@@ -1074,7 +1222,55 @@ class Bot:
                     # Print PnL
                     self.pnl_tracker.print_pnl()
                 else:
-                    logger.debug("No order updates needed (PropMaintain kept existing orders)")
+                    logger.debug("No order updates needed (quoters kept existing orders)")
+
+                # Write iteration metrics to InfluxDB
+                if self.influx:
+                    current_position = self.position_tracker.get_current_position()
+                    stop_bids = current_position > self.bot_config.max_position
+                    stop_asks = current_position < -self.bot_config.max_position
+
+                    # Compute TPS
+                    now = time.monotonic()
+                    elapsed = now - self._last_state_write_time
+                    tps = self._tx_count / elapsed if elapsed > 0 else 0.0
+                    self._tx_count = 0
+                    self._last_state_write_time = now
+
+                    # Build order price snapshot
+                    order_prices: dict = {}
+                    bids = sorted(
+                        [o for o in self.active_orders.values() if o.side == OrderSide.BUY],
+                        key=lambda o: o.price, reverse=True,
+                    )
+                    asks = sorted(
+                        [o for o in self.active_orders.values() if o.side == OrderSide.SELL],
+                        key=lambda o: o.price,
+                    )
+                    for i, o in enumerate(bids):
+                        order_prices[f"bid_{i}"] = float(o.price)
+                    for i, o in enumerate(asks):
+                        order_prices[f"ask_{i}"] = float(o.price)
+                    best_bid = float(bids[0].price) if bids else None
+                    best_ask = float(asks[0].price) if asks else None
+
+                    pnl_val = self.pnl_tracker.get_pnl()
+                    self.influx.write_state(
+                        reference_price=float(reference_price),
+                        position=float(current_position),
+                        pnl=float(pnl_val) if pnl_val is not None else None,
+                        num_active_orders=len(self.active_cloids),
+                        num_cancels=num_cancels,
+                        num_new_orders=num_new_orders,
+                        stop_bids=stop_bids,
+                        stop_asks=stop_asks,
+                        tps=tps,
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        order_prices=order_prices,
+                        cumulative_edge_pnl=self._cumulative_edge_pnl,
+                        cumulative_edge_pnl_by_quoter=self._cumulative_edge_pnl_by_quoter,
+                    )
 
                 # Sleep 1 second
                 try:
@@ -1099,13 +1295,78 @@ class Bot:
                 logger.error(f"Error in main loop: {e}")
                 await asyncio.sleep(1.0)
 
-    def _generate_orders_with_prop_maintain(
+    def _resolve_order_price(
+        self,
+        cloid: str,
+        on_chain_by_cloid: dict,
+    ) -> tuple[Optional[Decimal], str]:
+        """
+        Resolve the price and source of an existing order from tracking dicts.
+
+        Priority: on_chain > callback > preregistered > unknown
+
+        Returns:
+            (price_or_none, source_string)
+        """
+        if cloid in on_chain_by_cloid:
+            order = on_chain_by_cloid[cloid]
+            price = _to_decimal(order.get('price', 0)) / Decimal(self.market_config.price_precision)
+            return price, "on_chain"
+        elif cloid in self.preregistered_orders:
+            return None, "preregistered"
+        elif cloid in self.active_orders:
+            return self.active_orders[cloid].price, "callback"
+        else:
+            return None, "unknown"
+
+    def _resolve_existing_orders(
+        self,
+        quoter: BaseQuoter,
+        on_chain_by_cloid: dict,
+    ) -> tuple[Optional[ExistingOrder], Optional[ExistingOrder]]:
+        """
+        Find and resolve this quoter's existing bid and ask orders
+        from the bot's tracking dicts.
+
+        Returns:
+            (existing_bid, existing_ask) — either may be None if no order found
+        """
+        existing_bid = None
+        existing_ask = None
+
+        # Primary: search active_cloids (callback-driven, no RPC lag)
+        for cloid in list(self.active_cloids):
+            if cloid.startswith(quoter.cloid_prefix_bid):
+                price, source = self._resolve_order_price(cloid, on_chain_by_cloid)
+                existing_bid = ExistingOrder(cloid=cloid, side=OrderSide.BUY, price=price, source=source)
+            elif cloid.startswith(quoter.cloid_prefix_ask):
+                price, source = self._resolve_order_price(cloid, on_chain_by_cloid)
+                existing_ask = ExistingOrder(cloid=cloid, side=OrderSide.SELL, price=price, source=source)
+
+        # Fallback: order just sent but ORDER_PLACED callback not yet received
+        if existing_bid is None:
+            for cloid in self.preregistered_orders:
+                if cloid.startswith(quoter.cloid_prefix_bid):
+                    existing_bid = ExistingOrder(cloid=cloid, side=OrderSide.BUY, price=None, source="preregistered")
+                    break
+        if existing_ask is None:
+            for cloid in self.preregistered_orders:
+                if cloid.startswith(quoter.cloid_prefix_ask):
+                    existing_ask = ExistingOrder(cloid=cloid, side=OrderSide.SELL, price=None, source="preregistered")
+                    break
+
+        return existing_bid, existing_ask
+
+    def _generate_orders(
         self,
         reference_price: Decimal,
         on_chain_orders: list,
     ) -> tuple[list[Order], int, int]:
         """
-        Generate orders using PropMaintain logic: only cancel orders below cancel threshold.
+        Generate orders by delegating to each quoter's decide() method.
+
+        The bot resolves order state from its tracking dicts into a QuoterContext,
+        then lets each quoter decide what to cancel and place.
 
         Args:
             reference_price: Current fair/reference price
@@ -1130,241 +1391,43 @@ class Bot:
 
         # Build map of on-chain orders by cloid (for our orders only)
         on_chain_by_cloid = {}
-        on_chain_order_ids = set()
-
         for order in on_chain_orders:
             order_id = int(order.get('orderid', 0))
             if order_id in self.order_id_to_cloid:
                 cloid = self.order_id_to_cloid[order_id]
                 on_chain_by_cloid[cloid] = order
-                on_chain_order_ids.add(order_id)
 
-        # For each quoter, check if existing orders meet cancel threshold
         for quoter in self.quoters:
-            # Get cancel thresholds (edges below which we cancel existing orders)
-            bid_cancel_edge, ask_cancel_edge = quoter.get_cancel_edges(self.bot_config.prop_maintain)
+            # Resolve existing orders for this quoter from tracking dicts
+            existing_bid, existing_ask = self._resolve_existing_orders(quoter, on_chain_by_cloid)
 
-            # Find existing orders for this quoter (by baseline_edge_bps in cloid)
-            quoter_prefix_bid = f"bid-{quoter.baseline_edge_bps}-"
-            quoter_prefix_ask = f"ask-{quoter.baseline_edge_bps}-"
+            # Build context snapshot for the quoter
+            ctx = QuoterContext(
+                reference_price=reference_price,
+                current_position=current_position,
+                max_position=_to_decimal(self.bot_config.max_position),
+                existing_bid=existing_bid,
+                existing_ask=existing_ask,
+                stop_bids=stop_bids,
+                stop_asks=stop_asks,
+                prop_maintain=self.bot_config.prop_maintain,
+                price_precision=Decimal(self.market_config.price_precision),
+            )
 
-            existing_bid_cloid = None
-            existing_ask_cloid = None
-            need_bid = True
-            need_ask = True
+            # Let the quoter decide what to cancel and place
+            decision = quoter.decide(ctx)
 
-            # Primary: search active_cloids (callback-driven, no RPC lag).
-            # This is the reliable source - it's updated immediately when callbacks fire,
-            # unlike on_chain_by_cloid which requires RPC to reflect the mined block.
-            for cloid in list(self.active_cloids):
-                if cloid.startswith(quoter_prefix_bid):
-                    existing_bid_cloid = cloid
-                elif cloid.startswith(quoter_prefix_ask):
-                    existing_ask_cloid = cloid
+            # Process cancels
+            for cloid in decision.cancels:
+                all_orders.append(Order(cloid=cloid, order_type=OrderType.CANCEL))
+                # Proactively remove from active_cloids so the next iteration doesn't
+                # find this stale cloid and mistakenly think the slot is still filled.
+                self.active_cloids.discard(cloid)
+                total_cancels += 1
 
-            # Fallback: order just sent but ORDER_PLACED callback not yet received
-            if existing_bid_cloid is None:
-                for cloid in self.preregistered_orders:
-                    if cloid.startswith(quoter_prefix_bid):
-                        existing_bid_cloid = cloid
-                        break
-            if existing_ask_cloid is None:
-                for cloid in self.preregistered_orders:
-                    if cloid.startswith(quoter_prefix_ask):
-                        existing_ask_cloid = cloid
-                        break
-
-            # Check bid: calculate edge and compare to cancel threshold
-            if existing_bid_cloid and existing_bid_cloid in on_chain_by_cloid:
-                order = on_chain_by_cloid[existing_bid_cloid]
-                order_price = _to_decimal(order.get('price', 0)) / Decimal(self.market_config.price_precision)
-                order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
-
-                # Cancel bid if position limit exceeded
-                if stop_bids:
-                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_bid_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling bid @ {float(order_price):.6f} "
-                        f"(position limit exceeded)"
-                    )
-                elif order_edge >= bid_cancel_edge:
-                    # Edge is good, keep the order
-                    need_bid = False
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Keeping bid @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} >= cancel_threshold={float(bid_cancel_edge):.1f})"
-                    )
-                else:
-                    # Edge too low, cancel it
-                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    # Proactively remove from active_cloids so the next iteration doesn't
-                    # find this stale cloid and mistakenly think the slot is still filled.
-                    self.active_cloids.discard(existing_bid_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling bid @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} < cancel_threshold={float(bid_cancel_edge):.1f})"
-                    )
-            elif existing_bid_cloid and existing_bid_cloid in self.preregistered_orders:
-                # Order just sent, awaiting on-chain confirmation - don't place another
-                need_bid = False
-                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Bid pending confirmation, holding")
-            elif existing_bid_cloid and existing_bid_cloid in self.active_orders:
-                # Confirmed on-chain (ORDER_PLACED received) but REST API hasn't indexed it yet.
-                # Use callback-tracked price for full edge evaluation — eliminates the blind window.
-                order_price = self.active_orders[existing_bid_cloid].price
-                order_edge = quoter.calculate_order_edge(order_price, OrderSide.BUY, reference_price)
-
-                # Cancel bid if position limit exceeded
-                if stop_bids:
-                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_bid_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling bid @ {float(order_price):.6f} "
-                        f"(position limit exceeded) [callback]"
-                    )
-                elif order_edge >= bid_cancel_edge:
-                    need_bid = False
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Keeping bid @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} >= cancel_threshold={float(bid_cancel_edge):.1f}) [callback]"
-                    )
-                else:
-                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_bid_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling bid @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} < cancel_threshold={float(bid_cancel_edge):.1f}) [callback]"
-                    )
-            elif existing_bid_cloid:
-                # In active_cloids but not in active_orders — unexpected state, hold.
-                need_bid = False
-                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Bid in unknown state, holding")
-
-            # Check ask: calculate edge and compare to cancel threshold
-            if existing_ask_cloid and existing_ask_cloid in on_chain_by_cloid:
-                order = on_chain_by_cloid[existing_ask_cloid]
-                order_price = _to_decimal(order.get('price', 0)) / Decimal(self.market_config.price_precision)
-                order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
-
-                # Cancel ask if position limit exceeded
-                if stop_asks:
-                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_ask_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling ask @ {float(order_price):.6f} "
-                        f"(position limit exceeded)"
-                    )
-                elif order_edge >= ask_cancel_edge:
-                    # Edge is good, keep the order
-                    need_ask = False
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Keeping ask @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} >= cancel_threshold={float(ask_cancel_edge):.1f})"
-                    )
-                else:
-                    # Edge too low, cancel it
-                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    # Proactively remove from active_cloids (same reason as bid above)
-                    self.active_cloids.discard(existing_ask_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling ask @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} < cancel_threshold={float(ask_cancel_edge):.1f})"
-                    )
-            elif existing_ask_cloid and existing_ask_cloid in self.preregistered_orders:
-                # Order just sent, awaiting on-chain confirmation - don't place another
-                need_ask = False
-                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Ask pending confirmation, holding")
-            elif existing_ask_cloid and existing_ask_cloid in self.active_orders:
-                # Confirmed on-chain (ORDER_PLACED received) but REST API hasn't indexed it yet.
-                # Use callback-tracked price for full edge evaluation — eliminates the blind window.
-                order_price = self.active_orders[existing_ask_cloid].price
-                order_edge = quoter.calculate_order_edge(order_price, OrderSide.SELL, reference_price)
-
-                # Cancel ask if position limit exceeded
-                if stop_asks:
-                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_ask_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling ask @ {float(order_price):.6f} "
-                        f"(position limit exceeded) [callback]"
-                    )
-                elif order_edge >= ask_cancel_edge:
-                    need_ask = False
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Keeping ask @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} >= cancel_threshold={float(ask_cancel_edge):.1f}) [callback]"
-                    )
-                else:
-                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_ask_cloid)
-                    logger.debug(
-                        f"Quoter {float(quoter.baseline_edge_bps):.2f}bps: "
-                        f"Cancelling ask @ {float(order_price):.6f} "
-                        f"(edge={float(order_edge):.1f} < cancel_threshold={float(ask_cancel_edge):.1f}) [callback]"
-                    )
-            elif existing_ask_cloid:
-                # In active_cloids but not in active_orders — unexpected state, hold.
-                need_ask = False
-                logger.debug(f"Quoter {quoter.baseline_edge_bps}bps: Ask in unknown state, holding")
-
-            # Coupling block: if one side needs replacement, force-replace the other too.
-            # This ensures both sides are re-priced with the current prop_of_max after a fill.
-            if need_bid and not need_ask:
-                # Bid is being replaced. Check if ask is still preregistered (mid-block race).
-                if existing_ask_cloid and existing_ask_cloid in self.preregistered_orders:
-                    logger.debug(f"Coupling: ask {existing_ask_cloid} still preregistered, skipping quoter this iteration")
-                    continue
-                need_ask = True
-                if existing_ask_cloid:
-                    all_orders.append(Order(cloid=existing_ask_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_ask_cloid)
-                    logger.debug(f"Coupling: cancelling ask {existing_ask_cloid} because bid was replaced")
-            elif need_ask and not need_bid:
-                # Ask is being replaced. Check if bid is still preregistered (mid-block race).
-                if existing_bid_cloid and existing_bid_cloid in self.preregistered_orders:
-                    logger.debug(f"Coupling: bid {existing_bid_cloid} still preregistered, skipping quoter this iteration")
-                    continue
-                need_bid = True
-                if existing_bid_cloid:
-                    all_orders.append(Order(cloid=existing_bid_cloid, order_type=OrderType.CANCEL))
-                    total_cancels += 1
-                    self.active_cloids.discard(existing_bid_cloid)
-                    logger.debug(f"Coupling: cancelling bid {existing_bid_cloid} because ask was replaced")
-
-            # Generate new orders for sides that need updating
-            # Apply position limits: stop quoting bids if position > max, stop asks if position < -max
-            final_need_bid = need_bid and not stop_bids
-            final_need_ask = need_ask and not stop_asks
-
-            new_quoter_orders = quoter.generate_orders(reference_price, need_bid=final_need_bid, need_ask=final_need_ask)
-            if new_quoter_orders:
-                all_orders.extend(new_quoter_orders)
-                total_new_orders += len(new_quoter_orders)
-                logger.debug(
-                    f"Quoter {quoter.baseline_edge_bps}bps: Generating {len(new_quoter_orders)} new orders "
-                    f"(bid={'yes' if final_need_bid else 'no'}, ask={'yes' if final_need_ask else 'no'})"
-                )
+            # Collect new orders
+            all_orders.extend(decision.new_orders)
+            total_new_orders += len(decision.new_orders)
 
         return all_orders, total_cancels, total_new_orders
 
@@ -1574,7 +1637,9 @@ class Bot:
             new_config.prop_skew_exit != self.bot_config.prop_skew_exit or
             new_config.quantity != self.bot_config.quantity or
             new_config.quantity_bps_per_level != self.bot_config.quantity_bps_per_level or
-            new_config.quoters_bps != self.bot_config.quoters_bps
+            new_config.quoters_bps != self.bot_config.quoters_bps or
+            new_config.quoter_type != self.bot_config.quoter_type or
+            new_config.quoters_config != self.bot_config.quoters_config
         )
 
         restart_required = (
@@ -1684,6 +1749,10 @@ class Bot:
         Stop the bot: cancel all active orders and stop the client.
         """
         logger.info("\n🛑 Stopping bot...")
+
+        # Flush and stop InfluxDB writer before anything else
+        if self.influx:
+            await self.influx.stop()
 
         # Cancel all active orders with exponential backoff
         await self._cancel_all_orders_with_retry()
